@@ -1,0 +1,1450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Flapstack</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  #stage {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    /* keep pixels crisp, no smoothing on the backing store scale */
+    image-rendering: -webkit-optimize-contrast;
+    cursor: pointer;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage" tabindex="0"></canvas>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Flapstack: a four-block piece with flappy-bird physics auto-scrolls toward a
+// stacking well and must be landed into the stack. Single file, Canvas 2D.
+// All tunables live in CONFIG so feel can be adjusted in one place.
+// ---------------------------------------------------------------------------
+
+const CONFIG = {
+  LOGICAL_W: 960,
+  LOGICAL_H: 540,
+
+  CELL: 30,
+  WELL_COLS: 10,
+  WELL_ROWS: 16,
+  WELL_MARGIN: 30,        // gap between well right edge and screen right edge
+
+  // Flappy physics (per second unless noted). Tuned for a Flappy Bird feel.
+  GRAVITY: 900,           // px/s^2 downward pull
+  FLAP_VY: -320,          // instant upward velocity set on flap (not additive)
+  TERMINAL_VY: 600,       // cap on downward speed
+  SCROLL_START: 120,      // starting rightward auto-scroll px/s
+  SCROLL_INC: 5,          // added per locked piece
+  SCROLL_MAX: 220,        // scroll speed cap
+
+  SPAWN_X: 40,            // piece origin x at spawn
+
+  // In-well handling aids. Inside the well airspace the scroll slows, and a
+  // fast dive bleeds scroll away further so the piece drops nearly straight
+  // down, which makes picking a column deliberate instead of a timing gamble.
+  WELL_SCROLL_FACTOR: 0.55, // scroll multiplier while the piece is over the columns
+  DIVE_BRAKE: 0.7,          // fraction of scroll removed at terminal fall speed
+
+  // Single pipe-style obstacle per flight.
+  OBSTACLE_X: 300,
+  OBSTACLE_W: 60,
+  GAP: 180,
+  OBSTACLE_MARGIN: 40,    // keeps the gap fully on screen
+
+  PASS_SCORE: 10,
+  CLEAN_PASS_BONUS: 5,    // extra for threading the middle third of the gap
+  LOCK_SCORE: 5,          // reward for every landed piece
+  LINE_SCORES: [0, 100, 250, 450, 700], // total points for 1..4 rows at once
+  ALL_CLEAR_BONUS: 500,   // emptying the well entirely
+  COMBO_STEP: 0.5,        // multiplier growth per consecutive clearing flight
+  COMBO_MAX_MULT: 3,
+  NEXT_COUNT: 3,          // pieces shown in the upcoming queue
+
+  LIVES_START: 3,
+  LIVES_MAX: 5,
+
+  GAP_SHRINK: 2,          // obstacle gap px removed per locked piece
+  GAP_MIN: 140,           // smallest obstacle gap the ramp reaches
+
+  DRIFT_START: 10,        // locked pieces before the gap starts to drift
+  DRIFT_AMP_PER_LOCK: 4,  // px of drift amplitude gained per lock past that
+  DRIFT_AMP_MAX: 60,
+  DRIFT_SPEED: 1.3,       // rad/s of the drift oscillation
+
+  SETTLE_DROP: 1100,      // px/s vertical glide of the wall landing
+  SETTLE_SLIDE: 320,      // px/s horizontal align of the wall landing
+
+  GAMEOVER_LOCKOUT: 500,  // ms of ignored input after death
+  FLASH_MS: 160,          // duration of the row clear flash
+  HIT_FLASH_MS: 220,      // red flash after losing a life
+  FLOATER_MS: 700,        // lifetime of rising score popups
+  ROT_ANIM_MS: 80,        // render-only rotation tween
+  SQUASH_MS: 130,         // flap squash pulse
+  SHAKE_MS: 220,          // screen shake decay
+  HEART: '#E0455A',       // lives display color (not part of the piece palette)
+
+  // Palette (deliberately not the standard falling-block genre palette).
+  BG: '#1E2430',          // dark slate background
+  INK: '#EDE8DC',         // off-white for well border and HUD text
+  OBSTACLE: '#5C6B7A',
+  OBSTACLE_EDGE: '#39424E',
+  GRID_LINE: 'rgba(237,232,220,0.08)',
+};
+
+// Piece colors assigned exactly as specified. Letters are shape ids only.
+const BASE_SHAPES = [
+  { name: 'I', color: '#E8604C', cells: [[0,0],[1,0],[2,0],[3,0]] }, // coral
+  { name: 'O', color: '#2D9C8A', cells: [[0,0],[1,0],[0,1],[1,1]] }, // teal
+  { name: 'T', color: '#E8B84C', cells: [[0,0],[1,0],[2,0],[1,1]] }, // amber
+  { name: 'S', color: '#7B6CB2', cells: [[1,0],[2,0],[0,1],[1,1]] }, // violet
+  { name: 'Z', color: '#4C86E8', cells: [[0,0],[1,0],[1,1],[2,1]] }, // azure
+  { name: 'J', color: '#C24C8A', cells: [[0,0],[0,1],[1,1],[2,1]] }, // magenta
+  { name: 'L', color: '#8AA84C', cells: [[2,0],[0,1],[1,1],[2,1]] }, // olive
+];
+
+// Rotate a set of integer cell coords 90 degrees clockwise on a y-down screen:
+// (x, y) -> (-y, x), then normalize so the smallest x and y are both zero.
+function rotateCW(cells) {
+  const r = cells.map(([x, y]) => [-y, x]);
+  const minx = Math.min.apply(null, r.map(c => c[0]));
+  const miny = Math.min.apply(null, r.map(c => c[1]));
+  return r.map(([x, y]) => [x - minx, y - miny]);
+}
+
+// Precompute all 4 rotation states for a shape. Some shapes repeat states
+// (for example the bar has only 2 distinct forms) but all 4 are stored so a
+// rotate press always advances the index and cycles.
+function buildRotations(baseCells) {
+  let cur = baseCells.map(c => c.slice());
+  const nx = Math.min.apply(null, cur.map(c => c[0]));
+  const ny = Math.min.apply(null, cur.map(c => c[1]));
+  cur = cur.map(([x, y]) => [x - nx, y - ny]);
+
+  const rotations = [];
+  for (let i = 0; i < 4; i++) {
+    const w = Math.max.apply(null, cur.map(c => c[0])) + 1;
+    const h = Math.max.apply(null, cur.map(c => c[1])) + 1;
+    rotations.push({ cells: cur.map(([dx, dy]) => ({ dx, dy })), w, h });
+    cur = rotateCW(cur);
+  }
+  return rotations;
+}
+
+const SHAPES = BASE_SHAPES.map(s => ({
+  name: s.name,
+  color: s.color,
+  rotations: buildRotations(s.cells),
+}));
+
+// Well geometry derived from CONFIG.
+const CELL = CONFIG.CELL;
+const WELL_COLS = CONFIG.WELL_COLS;
+const WELL_ROWS = CONFIG.WELL_ROWS;
+const WELL_W = WELL_COLS * CELL;                                  // 300
+const WELL_H = WELL_ROWS * CELL;                                  // 480
+const WELL_X = CONFIG.LOGICAL_W - CONFIG.WELL_MARGIN - WELL_W;    // 630 (left, open)
+const WELL_Y = (CONFIG.LOGICAL_H - WELL_H) / 2;                   // 30  (top)
+const WELL_R = WELL_X + WELL_W;                                   // 930 (right wall)
+const WELL_B = WELL_Y + WELL_H;                                   // 510 (floor)
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+function makeEmptyGrid() {
+  const g = [];
+  for (let r = 0; r < WELL_ROWS; r++) g.push(new Array(WELL_COLS).fill(null));
+  return g;
+}
+
+const game = {
+  state: 'START',        // START, FLYING, PAUSED, GAMEOVER
+  mode: 'free',          // free | daily (seeded run shared by everyone today)
+  grid: makeEmptyGrid(), // grid[row][col] = color string or null
+  score: 0,
+  lines: 0,
+  lives: CONFIG.LIVES_START,
+  best: 0,               // loaded from storage at boot
+  dailyBest: 0,
+  newBest: false,
+  combo: 0,              // consecutive clearing flights
+  stats: { pieces: 0, passes: 0, bestCombo: 1 },
+  playTime: 0,           // seconds of physics simulated this run
+  scrollSpeed: CONFIG.SCROLL_START,
+  obstacleGap: CONFIG.GAP,
+  rng: null,             // seeded PRNG for the bag and obstacle rolls
+  bag: [],
+  nextQueue: [],         // upcoming shape indices, length NEXT_COUNT
+  hold: null,            // stashed shape index
+  canHold: true,         // one swap per flight
+  piece: null,           // { shapeIndex, rot, ox, oy, vy }
+  obstacle: null,        // { x, w, gap, baseTop, amp, phase, gapTop, gapBottom }
+  passed: false,         // has the current flight scored the obstacle pass
+  crossMinY: Infinity,   // piece extent while crossing the obstacle column
+  crossMaxY: -Infinity,
+  settle: null,          // { tx, ty } while gliding into a wall landing
+  gameOverAt: 0,
+  hitAt: 0,              // timestamp of the last life loss, for the red flash
+  flashRows: [],         // rows highlighted briefly after a clear
+  flashAt: 0,
+  floaters: [],          // rising score popups: { x, y, text, at }
+  particles: [],         // crash and clear debris
+  lastParticleT: 0,
+  shakeAt: 0,
+  shakeMag: 0,
+  rotAnim: null,         // { from: blocks, at } render-only rotation tween
+  flapAt: 0,             // render-only squash pulse
+  lockEvents: [],        // debug log of each lock: { cells, supported }
+};
+
+// Seeded PRNG so daily mode gives everyone the same run; free mode reseeds
+// randomly every run. Render-only effects still use Math.random.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function hashStr(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+
+function dailyDateStr() {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return d.getFullYear() + '-' + mm + '-' + dd;
+}
+
+function loadDailyBest() {
+  try { game.dailyBest = parseInt(localStorage.getItem('flapstack.daily.' + dailyDateStr()), 10) || 0; }
+  catch (e) { game.dailyBest = 0; }
+}
+
+game.rng = mulberry32((Math.random() * 0xFFFFFFFF) >>> 0);
+try { game.best = parseInt(localStorage.getItem('flapstack.best'), 10) || 0; } catch (e) { game.best = 0; }
+loadDailyBest();
+
+// ---------------------------------------------------------------------------
+// Sound: a tiny WebAudio synth, no asset files. M toggles mute (persisted).
+// The context is created lazily on the first sound after a user gesture.
+// ---------------------------------------------------------------------------
+
+const audio = { ctx: null, muted: false };
+try { audio.muted = localStorage.getItem('flapstack.muted') === '1'; } catch (e) {}
+
+function audioContext() {
+  if (!audio.ctx) {
+    try { audio.ctx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { audio.ctx = null; }
+  }
+  if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
+  return audio.ctx;
+}
+
+function toggleMute() {
+  audio.muted = !audio.muted;
+  try { localStorage.setItem('flapstack.muted', audio.muted ? '1' : '0'); } catch (e) {}
+}
+
+// One enveloped oscillator note. delay and dur are in seconds.
+function tone(delay, freq, dur, type, vol, slideTo) {
+  if (audio.muted) return;
+  const ac = audioContext();
+  if (!ac) return;
+  const t0 = ac.currentTime + delay;
+  const osc = ac.createOscillator();
+  const g = ac.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t0);
+  if (slideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(1, slideTo), t0 + dur);
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  osc.connect(g);
+  g.connect(ac.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.03);
+}
+
+const SFX = {
+  flap()   { tone(0, 330, 0.09, 'triangle', 0.10, 520); },
+  rotate() { tone(0, 480, 0.05, 'square', 0.05); },
+  hold()   { tone(0, 420, 0.07, 'triangle', 0.08, 300); },
+  pass(clean) {
+    tone(0, 640, 0.10, 'sine', 0.12, 860);
+    if (clean) tone(0.08, 960, 0.12, 'sine', 0.12, 1280);
+  },
+  lock()   { tone(0, 170, 0.09, 'square', 0.13, 110); },
+  clear(n) {
+    const notes = [523, 659, 784, 1047, 1319];
+    for (let i = 0; i <= Math.min(n, 3); i++) tone(i * 0.06, notes[i], 0.14, 'sine', 0.11);
+  },
+  allClear() {
+    const notes = [523, 659, 784, 1047, 1319];
+    for (let i = 0; i < notes.length; i++) tone(i * 0.07, notes[i], 0.18, 'triangle', 0.12);
+  },
+  heart()  { tone(0, 784, 0.10, 'sine', 0.10, 900); tone(0.09, 1047, 0.14, 'sine', 0.10); },
+  hit()    { tone(0, 150, 0.22, 'sawtooth', 0.16, 55); },
+  gameOver() { tone(0, 392, 0.5, 'sawtooth', 0.12, 90); tone(0.12, 196, 0.6, 'sawtooth', 0.09, 60); },
+};
+
+// ---------------------------------------------------------------------------
+// 7-bag randomizer
+// ---------------------------------------------------------------------------
+
+function newBag() {
+  const b = [0, 1, 2, 3, 4, 5, 6];
+  for (let i = b.length - 1; i > 0; i--) {
+    const j = Math.floor(game.rng() * (i + 1));
+    const t = b[i]; b[i] = b[j]; b[j] = t;
+  }
+  game.bag = b;
+}
+
+function nextFromBag() {
+  if (game.bag.length === 0) newBag();
+  return game.bag.shift();
+}
+
+// ---------------------------------------------------------------------------
+// Piece helpers
+// ---------------------------------------------------------------------------
+
+function blocksOf(p) {
+  const rot = SHAPES[p.shapeIndex].rotations[p.rot];
+  return rot.cells.map(o => ({ x: p.ox + o.dx * CELL, y: p.oy + o.dy * CELL }));
+}
+
+function newObstacle() {
+  const gap = game.obstacleGap;
+  const minTop = CONFIG.OBSTACLE_MARGIN;
+  const maxTop = CONFIG.LOGICAL_H - gap - CONFIG.OBSTACLE_MARGIN;
+  const baseTop = minTop + game.rng() * (maxTop - minTop);
+  // past DRIFT_START locks the gap oscillates; amplitude grows per lock and
+  // is clamped so the gap always stays fully on screen
+  let amp = 0;
+  const over = game.stats.pieces - CONFIG.DRIFT_START;
+  if (over > 0) amp = Math.min(CONFIG.DRIFT_AMP_MAX, over * CONFIG.DRIFT_AMP_PER_LOCK);
+  amp = Math.max(0, Math.min(amp, baseTop - minTop, maxTop - baseTop));
+  game.obstacle = {
+    x: CONFIG.OBSTACLE_X,
+    w: CONFIG.OBSTACLE_W,
+    gap: gap,
+    baseTop: baseTop,
+    amp: amp,
+    phase: game.rng() * Math.PI * 2,
+    gapTop: baseTop,
+    gapBottom: baseTop + gap,
+  };
+}
+
+function spawnPiece() {
+  const idx = game.nextQueue.shift();
+  game.nextQueue.push(nextFromBag());
+  const rot0 = SHAPES[idx].rotations[0];
+  game.piece = {
+    shapeIndex: idx,
+    rot: 0,
+    ox: CONFIG.SPAWN_X,
+    oy: CONFIG.LOGICAL_H / 2 - (rot0.h * CELL) / 2, // vertically centered
+    vy: 0,
+  };
+  game.passed = false;
+  game.crossMinY = Infinity;
+  game.crossMaxY = -Infinity;
+  game.canHold = true;
+  game.rotAnim = null;
+  newObstacle();
+}
+
+function startRun() {
+  const seed = game.mode === 'daily'
+    ? hashStr('flapstack-' + dailyDateStr())
+    : (Math.random() * 0xFFFFFFFF) >>> 0;
+  game.rng = mulberry32(seed);
+  game.grid = makeEmptyGrid();
+  game.score = 0;
+  game.lines = 0;
+  game.lives = CONFIG.LIVES_START;
+  game.newBest = false;
+  game.combo = 0;
+  game.stats = { pieces: 0, passes: 0, bestCombo: 1 };
+  game.playTime = 0;
+  game.scrollSpeed = CONFIG.SCROLL_START;
+  game.obstacleGap = CONFIG.GAP;
+  game.bag = [];
+  game.hold = null;
+  game.lockEvents = [];
+  game.flashRows = [];
+  game.floaters = [];
+  game.particles = [];
+  game.settle = null;
+  game.hitAt = 0;
+  newBag();
+  game.nextQueue = [];
+  for (let i = 0; i < CONFIG.NEXT_COUNT; i++) game.nextQueue.push(nextFromBag());
+  spawnPiece();
+  game.state = 'FLYING';
+}
+
+// Daily mode reruns the same seeded sequence for everyone on the same date.
+// Toggling is only allowed between runs.
+function toggleMode() {
+  if (game.state !== 'START' && game.state !== 'GAMEOVER') return;
+  game.mode = game.mode === 'daily' ? 'free' : 'daily';
+  if (game.mode === 'daily') loadDailyBest();
+}
+
+function gameOver() {
+  game.state = 'GAMEOVER';
+  game.gameOverAt = performance.now();
+  SFX.gameOver();
+  shake(9);
+  if (game.score > game.best) {
+    game.best = game.score;
+    if (game.mode === 'free') game.newBest = true;
+    try { localStorage.setItem('flapstack.best', String(game.best)); } catch (e) {}
+  }
+  if (game.mode === 'daily' && game.score > game.dailyBest) {
+    game.dailyBest = game.score;
+    game.newBest = true;
+    try { localStorage.setItem('flapstack.daily.' + dailyDateStr(), String(game.score)); } catch (e) {}
+  }
+}
+
+// Losing a life forfeits the current piece and launches a fresh flight; the
+// run only ends when no hearts remain. Topping out ends the run outright.
+function loseLife() {
+  if (game.state !== 'FLYING') return;
+  game.lives -= 1;
+  game.combo = 0;
+  game.hitAt = performance.now();
+  if (game.piece) {
+    const color = SHAPES[game.piece.shapeIndex].color;
+    for (const b of blocksOf(game.piece)) {
+      spawnBurst(b.x + CELL / 2, b.y + CELL / 2, color, 6, 260);
+    }
+  }
+  shake(6);
+  SFX.hit();
+  if (game.lives <= 0) { gameOver(); return; }
+  spawnPiece();
+}
+
+function flap() {
+  if (game.piece && !game.settle) {
+    game.piece.vy = CONFIG.FLAP_VY;
+    game.flapAt = performance.now();
+    SFX.flap();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Collision predicates
+// ---------------------------------------------------------------------------
+
+function hitsObstacle(blocks) {
+  const o = game.obstacle;
+  if (!o) return false;
+  for (const b of blocks) {
+    // horizontal overlap with the pipe column
+    if (b.x < o.x + o.w && b.x + CELL > o.x) {
+      // hits the top bar or the bottom bar (the gap spans gapTop..gapBottom)
+      if (b.y < o.gapTop || b.y + CELL > o.gapBottom) return true;
+    }
+  }
+  return false;
+}
+
+// Rotation is a no-op if the candidate blocks intersect the obstacle, the
+// stack, the well walls, or leave the screen.
+function rotationValid(blocks) {
+  for (const b of blocks) {
+    // off screen
+    if (b.x < 0 || b.x + CELL > CONFIG.LOGICAL_W || b.y < 0 || b.y + CELL > CONFIG.LOGICAL_H) {
+      return false;
+    }
+  }
+  if (hitsObstacle(blocks)) return false;
+  for (const b of blocks) {
+    const inColumns = b.x >= WELL_X && b.x < WELL_R;
+    if (inColumns) {
+      // well top wall and bottom wall
+      if (b.y < WELL_Y) return false;
+      if (b.y + CELL > WELL_B) return false;
+    }
+    // right wall
+    if (b.x + CELL > WELL_R && b.y + CELL > WELL_Y && b.y < WELL_B) return false;
+    // overlap with an occupied cell
+    const c0 = Math.floor((b.x - WELL_X) / CELL);
+    const r0 = Math.floor((b.y - WELL_Y) / CELL);
+    for (let rr = r0; rr <= r0 + 1; rr++) {
+      for (let cc = c0; cc <= c0 + 1; cc++) {
+        if (rr < 0 || rr >= WELL_ROWS || cc < 0 || cc >= WELL_COLS) continue;
+        if (!game.grid[rr][cc]) continue;
+        const cx = WELL_X + cc * CELL, cy = WELL_Y + rr * CELL;
+        if (b.x < cx + CELL && b.x + CELL > cx && b.y < cy + CELL && b.y + CELL > cy) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+function tryRotate() {
+  if (game.state !== 'FLYING' || !game.piece || game.settle) return;
+  const p = game.piece;
+  const cur = SHAPES[p.shapeIndex].rotations[p.rot];
+  const nextRot = (p.rot + 1) % 4;
+  const next = SHAPES[p.shapeIndex].rotations[nextRot];
+  // rotate around the bounding-box center so the piece pivots in place
+  const cx = p.ox + (cur.w * CELL) / 2;
+  const cy = p.oy + (cur.h * CELL) / 2;
+  const nox = cx - (next.w * CELL) / 2;
+  const noy = cy - (next.h * CELL) / 2;
+  const candidate = next.cells.map(o => ({ x: nox + o.dx * CELL, y: noy + o.dy * CELL }));
+  if (rotationValid(candidate)) {
+    game.rotAnim = { from: blocksOf(p), at: performance.now() };
+    p.rot = nextRot;
+    p.ox = nox;
+    p.oy = noy;
+    SFX.rotate();
+  }
+}
+
+// Hold: stash the current shape and keep flying with the swapped-in one,
+// centered on the same bounding box, rotation reset. One swap per flight,
+// and a swap that would not fit is a no-op just like rotation. An empty
+// slot swaps in the head of the next queue.
+function tryHold() {
+  if (game.state !== 'FLYING' || !game.piece || game.settle || !game.canHold) return;
+  const p = game.piece;
+  const cur = SHAPES[p.shapeIndex].rotations[p.rot];
+  const incoming = game.hold !== null ? game.hold : game.nextQueue[0];
+  const next0 = SHAPES[incoming].rotations[0];
+  const cx = p.ox + (cur.w * CELL) / 2;
+  const cy = p.oy + (cur.h * CELL) / 2;
+  const nox = cx - (next0.w * CELL) / 2;
+  const noy = cy - (next0.h * CELL) / 2;
+  const candidate = next0.cells.map(o => ({ x: nox + o.dx * CELL, y: noy + o.dy * CELL }));
+  if (!rotationValid(candidate)) return;
+  game.rotAnim = { from: blocksOf(p), at: performance.now() };
+  if (game.hold === null) {
+    game.nextQueue.shift();
+    game.nextQueue.push(nextFromBag());
+  }
+  game.hold = p.shapeIndex;
+  p.shapeIndex = incoming;
+  p.rot = 0;
+  p.ox = nox;
+  p.oy = noy;
+  game.canHold = false;
+  SFX.hold();
+}
+
+// ---------------------------------------------------------------------------
+// Grid placement helpers shared by the wall landing and the ghost preview.
+// ---------------------------------------------------------------------------
+
+function canPlace(shapeIndex, rotIndex, col0, row0) {
+  const rot = SHAPES[shapeIndex].rotations[rotIndex];
+  for (const o of rot.cells) {
+    const c = col0 + o.dx, r = row0 + o.dy;
+    if (c < 0 || c >= WELL_COLS || r < 0 || r >= WELL_ROWS) return false;
+    if (game.grid[r][c]) return false;
+  }
+  return true;
+}
+
+// Lowest row the piece can rest at when dropping straight down from
+// (col0, row0). Returns null when the starting placement itself is invalid.
+function restingRow(shapeIndex, rotIndex, col0, row0) {
+  if (!canPlace(shapeIndex, rotIndex, col0, row0)) return null;
+  let r = row0;
+  while (canPlace(shapeIndex, rotIndex, col0, r + 1)) r++;
+  return r;
+}
+
+// Reaching the right wall is not a death: the piece glides down to the
+// nearest columns and locks where it comes to rest, with one row of upward
+// forgiveness for a snap that rounded into the stack. With no room at all
+// the arrival costs a life instead.
+function beginWallSettle() {
+  const p = game.piece;
+  const rot = SHAPES[p.shapeIndex].rotations[p.rot];
+  const col0 = Math.max(0, Math.min(WELL_COLS - rot.w, Math.round((p.ox - WELL_X) / CELL)));
+  const row0 = Math.max(0, Math.min(WELL_ROWS - rot.h, Math.round((p.oy - WELL_Y) / CELL)));
+  let rest = restingRow(p.shapeIndex, p.rot, col0, row0);
+  if (rest === null && row0 > 0) rest = restingRow(p.shapeIndex, p.rot, col0, row0 - 1);
+  if (rest === null) { loseLife(); return; }
+  game.settle = { tx: WELL_X + col0 * CELL, ty: WELL_Y + rest * CELL };
+}
+
+// Advance the wall-landing glide: align horizontally while dropping fast, and
+// lock the moment the piece reaches its resting cell. Input is ignored and the
+// vertical path is collision free by construction (restingRow walked it).
+function stepSettle(dt) {
+  const p = game.piece, s = game.settle;
+  const mx = CONFIG.SETTLE_SLIDE * dt, my = CONFIG.SETTLE_DROP * dt;
+  const dx = s.tx - p.ox, dy = s.ty - p.oy;
+  p.ox = Math.abs(dx) <= mx ? s.tx : p.ox + Math.sign(dx) * mx;
+  p.oy = Math.abs(dy) <= my ? s.ty : p.oy + Math.sign(dy) * my;
+  if (p.ox === s.tx && p.oy === s.ty) {
+    game.settle = null;
+    lockPiece();
+  }
+}
+
+// Landing preview: where the piece would come to rest if it dropped straight
+// down from its current snap column. Null while the piece is not over the
+// well or the snap position is invalid.
+function ghostCells() {
+  const p = game.piece;
+  if (!p) return null;
+  const rot = SHAPES[p.shapeIndex].rotations[p.rot];
+  const col0 = Math.round((p.ox - WELL_X) / CELL);
+  if (col0 < 0 || col0 > WELL_COLS - rot.w) return null;
+  const row0 = Math.max(0, Math.round((p.oy - WELL_Y) / CELL));
+  const rest = restingRow(p.shapeIndex, p.rot, col0, row0);
+  if (rest === null) return null;
+  return rot.cells.map(o => ({ c: col0 + o.dx, r: rest + o.dy }));
+}
+
+// ---------------------------------------------------------------------------
+// Lock: snap the origin to the nearest cell, derive all blocks from it,
+// validate, write to the grid, clear lines, check top-out.
+// ---------------------------------------------------------------------------
+
+function lockPiece() {
+  const p = game.piece;
+  const rot = SHAPES[p.shapeIndex].rotations[p.rot];
+  const col0 = Math.round((p.ox - WELL_X) / CELL);
+  const row0 = Math.round((p.oy - WELL_Y) / CELL);
+  const cells = rot.cells.map(o => ({ c: col0 + o.dx, r: row0 + o.dy }));
+
+  // validate: every derived cell must be inside the well and unoccupied
+  for (const cell of cells) {
+    if (cell.c < 0 || cell.c >= WELL_COLS || cell.r < 0 || cell.r >= WELL_ROWS || game.grid[cell.r][cell.c]) {
+      loseLife();
+      return;
+    }
+  }
+
+  // support check: at least one block must rest on the floor or an existing
+  // cell. A snap that leaves the whole piece floating is an invalid landing
+  // and costs a life, so a locked piece always has support beneath it.
+  const occupies = (c, r) => cells.some(x => x.c === c && x.r === r);
+  let supported = false;
+  for (const cell of cells) {
+    if (cell.r + 1 >= WELL_ROWS) { supported = true; break; }
+    if (game.grid[cell.r + 1][cell.c] && !occupies(cell.c, cell.r + 1)) { supported = true; break; }
+  }
+  if (!supported) { loseLife(); return; }
+
+  const color = SHAPES[p.shapeIndex].color;
+  for (const cell of cells) game.grid[cell.r][cell.c] = color;
+  game.lockEvents.push({ cells: cells.map(c => ({ c: c.c, r: c.r })), supported });
+  game.score += CONFIG.LOCK_SCORE;
+  game.stats.pieces += 1;
+
+  // clear full rows and shift everything above down. Collect indices first so
+  // the brief flash highlights the rows where the lines actually were.
+  const fullRows = [];
+  for (let r = 0; r < WELL_ROWS; r++) {
+    if (game.grid[r].every(x => x !== null)) fullRows.push(r);
+  }
+  // debris bursts use the cell colors, captured before the rows vanish
+  for (const r of fullRows) {
+    for (let c = 0; c < WELL_COLS; c++) {
+      spawnBurst(WELL_X + c * CELL + CELL / 2, WELL_Y + r * CELL + CELL / 2, game.grid[r][c], 2, 200);
+    }
+  }
+  for (const r of fullRows) {
+    game.grid.splice(r, 1);
+    game.grid.unshift(new Array(WELL_COLS).fill(null));
+  }
+  if (fullRows.length > 0) {
+    const n = Math.min(4, fullRows.length);
+    // consecutive clearing flights build a multiplier on the line points
+    game.combo += 1;
+    const mult = Math.min(CONFIG.COMBO_MAX_MULT, 1 + CONFIG.COMBO_STEP * (game.combo - 1));
+    if (mult > game.stats.bestCombo) game.stats.bestCombo = mult;
+    const points = Math.round(CONFIG.LINE_SCORES[n] * mult);
+    game.score += points;
+    game.lines += fullRows.length;
+    game.flashRows = fullRows.slice();
+    game.flashAt = performance.now();
+    shake(2 + n * 1.5);
+    SFX.clear(n);
+    const fx = WELL_X + WELL_W / 2;
+    const fy = WELL_Y + fullRows[0] * CELL + CELL / 2;
+    addFloater(fx, fy, mult > 1 ? '+' + points + ' x' + mult.toFixed(1) : '+' + points);
+    // every completed row restores a heart, up to the maximum
+    const gained = Math.min(CONFIG.LIVES_MAX, game.lives + fullRows.length) - game.lives;
+    if (gained > 0) {
+      game.lives += gained;
+      addFloater(fx, fy + 26, gained === 1 ? '+1 LIFE' : '+' + gained + ' LIVES');
+      SFX.heart();
+    }
+    // emptying the well entirely earns a flat bonus on top
+    if (game.grid.every(row => row.every(x => x === null))) {
+      game.score += CONFIG.ALL_CLEAR_BONUS;
+      addFloater(fx, fy - 26, 'ALL CLEAR +' + CONFIG.ALL_CLEAR_BONUS);
+      shake(8);
+      SFX.allClear();
+    }
+  } else {
+    game.combo = 0;
+    SFX.lock();
+  }
+
+  // top-out: blocks in the top 2 rows end the run outright, hearts or not
+  for (let r = 0; r < 2; r++) {
+    for (let c = 0; c < WELL_COLS; c++) {
+      if (game.grid[r][c]) { gameOver(); return; }
+    }
+  }
+
+  // difficulty ramp, then next flight
+  game.scrollSpeed = Math.min(CONFIG.SCROLL_MAX, game.scrollSpeed + CONFIG.SCROLL_INC);
+  game.obstacleGap = Math.max(CONFIG.GAP_MIN, game.obstacleGap - CONFIG.GAP_SHRINK);
+  spawnPiece();
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-timestep physics step
+// ---------------------------------------------------------------------------
+
+function step(dt) {
+  game.playTime += dt;
+  if (game.settle) { stepSettle(dt); return; }
+  const p = game.piece;
+  const prev = blocksOf(p);
+
+  // obstacle drift: at high difficulty the gap slides up and down
+  const ob = game.obstacle;
+  if (ob.amp > 0) {
+    ob.gapTop = ob.baseTop + Math.sin(game.playTime * CONFIG.DRIFT_SPEED + ob.phase) * ob.amp;
+    ob.gapBottom = ob.gapTop + ob.gap;
+  }
+
+  // integrate. Inside the well airspace the air is thicker: scroll slows, and
+  // a fast dive bleeds scroll away further so the piece drops nearly straight
+  // down, which makes aiming at a column deliberate.
+  p.vy = Math.min(p.vy + CONFIG.GRAVITY * dt, CONFIG.TERMINAL_VY);
+  let scroll = game.scrollSpeed;
+  const inWell = prev.every(b => b.x + CELL / 2 >= WELL_X);
+  if (inWell) {
+    scroll *= CONFIG.WELL_SCROLL_FACTOR;
+    if (p.vy > 0) scroll *= 1 - CONFIG.DIVE_BRAKE * (p.vy / CONFIG.TERMINAL_VY);
+  }
+  p.ox += scroll * dt;
+  p.oy += p.vy * dt;
+
+  let cur = blocksOf(p);
+
+  // The well's top border is a solid ceiling, not a hazard: a piece over the
+  // columns that rises into it (or drifts in just above it) is pushed back
+  // down to ride along the underside instead of losing a life.
+  let bump = 0;
+  for (const b of cur) {
+    if (b.x + CELL > WELL_X && b.x < WELL_R && b.y < WELL_Y) {
+      bump = Math.max(bump, WELL_Y - b.y);
+    }
+  }
+  if (bump > 0) {
+    p.oy += bump;
+    if (p.vy < 0) p.vy = 0;
+    cur = blocksOf(p);
+  }
+
+  // 1. obstacle collision
+  if (hitsObstacle(cur)) { loseLife(); return; }
+
+  // track the piece's vertical extent while inside the obstacle column, to
+  // judge a clean pass through the middle third of the gap
+  for (const b of cur) {
+    if (b.x + CELL > ob.x && b.x < ob.x + ob.w) {
+      if (b.y < game.crossMinY) game.crossMinY = b.y;
+      if (b.y + CELL > game.crossMaxY) game.crossMaxY = b.y + CELL;
+    }
+  }
+
+  // obstacle pass scoring, at most once per flight; threading the middle
+  // third of the gap the whole way through is a clean pass worth a bonus
+  if (!game.passed && cur.every(b => b.x > ob.x + ob.w)) {
+    const third = ob.gap / 3;
+    const clean = game.crossMaxY > -Infinity &&
+                  game.crossMinY >= ob.gapTop + third - 0.001 &&
+                  game.crossMaxY <= ob.gapBottom - third + 0.001;
+    const pts = CONFIG.PASS_SCORE + (clean ? CONFIG.CLEAN_PASS_BONUS : 0);
+    game.score += pts;
+    game.passed = true;
+    game.stats.passes += 1;
+    addFloater(cur[0].x + CELL / 2, cur[0].y - 10, clean ? '+' + pts + ' CLEAN' : '+' + pts);
+    SFX.pass(clean);
+  }
+
+  // 2. flight-zone ceiling and floor, for any block left of the well columns
+  for (const b of cur) {
+    if (b.x < WELL_X) {
+      if (b.y <= 0 || b.y + CELL >= CONFIG.LOGICAL_H) { loseLife(); return; }
+    }
+  }
+
+  // collect occupied cells once for the stack checks
+  const occ = [];
+  for (let r = 0; r < WELL_ROWS; r++) {
+    for (let c = 0; c < WELL_COLS; c++) {
+      if (game.grid[r][c]) occ.push({ c, r, cx: WELL_X + c * CELL, cy: WELL_Y + r * CELL });
+    }
+  }
+
+  // downward contact -> lock candidate. A block counts as landing on the floor
+  // or on a cell's top face only when the block's horizontal center is over that
+  // column, so detection agrees with the nearest-cell origin snap in lockPiece.
+  // (Testing raw overlap here would let a few-pixel corner clip of an adjacent
+  // column trigger a lock that then snaps into a different, unsupported column.)
+  let downward = false;
+  for (let i = 0; i < cur.length; i++) {
+    const b = cur[i], pb = prev[i];
+    const bcx = b.x + CELL / 2, bb = b.y + CELL, pbb = pb.y + CELL;
+    // floor
+    if (bcx > WELL_X && bcx < WELL_R) {
+      if (pbb <= WELL_B + 0.001 && bb >= WELL_B - 0.001) { downward = true; break; }
+    }
+    // top face of an occupied cell in the same column as the block center
+    for (const cell of occ) {
+      if (bcx > cell.cx && bcx < cell.cx + CELL) {
+        if (pbb <= cell.cy + 0.001 && bb >= cell.cy - 0.001) { downward = true; break; }
+      }
+    }
+    if (downward) break;
+  }
+
+  // The spec allows a lock only while the piece's full horizontal extent is
+  // within the well columns. A quarter-cell tolerance lets a landing frame that
+  // has drifted a pixel or two past the right wall still lock, while a piece
+  // overhanging the open left entrance is rejected and falls through to the
+  // band / wall / side deaths below as it keeps descending. lockPiece itself
+  // then snaps, validates bounds and occupancy, and requires real support, so a
+  // downward landing that resolves to an unsupported or invalid cell ends the
+  // run instead of committing. This whole block is evaluated before the side and
+  // right-wall deaths so a piece touching down in the wall-adjacent column locks
+  // rather than dying to the wall it is resting against.
+  if (downward) {
+    const TOL = CELL / 4;
+    const contained = cur.every(b => b.x >= WELL_X - TOL && b.x + CELL <= WELL_R + TOL);
+    if (contained) { lockPiece(); return; }
+  }
+
+  // bottom band below the well floor, for blocks inside the column x-range
+  for (const b of cur) {
+    if (b.x >= WELL_X && b.x < WELL_R && b.y + CELL > WELL_B + 0.001) { loseLife(); return; }
+  }
+
+  // right wall: arriving at the end of the flight starts the settle glide
+  // down into the stack. The screen edge itself stays a crash (only
+  // reachable outside the well rows).
+  for (const b of cur) {
+    if (b.x + CELL > WELL_R && b.y + CELL > WELL_Y && b.y < WELL_B) { beginWallSettle(); return; }
+    if (b.x + CELL >= CONFIG.LOGICAL_W) { loseLife(); return; }
+  }
+
+  // rightward contact with the side face of a stack column -> crash
+  for (let i = 0; i < cur.length; i++) {
+    const b = cur[i], pb = prev[i];
+    const bt = b.y, bb = b.y + CELL, br = b.x + CELL, pbr = pb.x + CELL;
+    for (const cell of occ) {
+      if (bb > cell.cy && bt < cell.cy + CELL) {            // vertical overlap
+        if (pbr <= cell.cx + 0.001 && br >= cell.cx - 0.001) { loseLife(); return; }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+const view = { s: 1, tx: 0, ty: 0 };
+
+function resize() {
+  const cssW = window.innerWidth;
+  const cssH = window.innerHeight;
+  let dpr = Math.max(1, window.devicePixelRatio || 1);
+  // Clamp the backing store so it never exceeds browser canvas limits on very
+  // large high-DPI windows (WebKit caps total canvas area near 16.7M px, and
+  // engines cap a single dimension near 16384). Exceeding the cap makes the
+  // allocation fail and the canvas draw nothing. Only reduce dpr, never raise
+  // it, so ordinary displays stay pixel-crisp and only extreme resolutions
+  // trade a little sharpness instead of going blank.
+  const MAX_DIM = 8192;
+  const MAX_AREA = 16 * 1024 * 1024;
+  const fit = Math.min(MAX_DIM / cssW, MAX_DIM / cssH, Math.sqrt(MAX_AREA / (cssW * cssH)));
+  if (fit < dpr) dpr = fit;
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  const scale = Math.min(cssW / CONFIG.LOGICAL_W, cssH / CONFIG.LOGICAL_H);
+  view.s = dpr * scale;
+  view.tx = dpr * (cssW - CONFIG.LOGICAL_W * scale) / 2;
+  view.ty = dpr * (cssH - CONFIG.LOGICAL_H * scale) / 2;
+}
+
+function drawObstacle() {
+  const o = game.obstacle;
+  if (!o) return;
+  ctx.fillStyle = CONFIG.OBSTACLE;
+  ctx.strokeStyle = CONFIG.OBSTACLE_EDGE;
+  ctx.lineWidth = 2;
+  // top bar
+  ctx.fillRect(o.x, 0, o.w, o.gapTop);
+  ctx.strokeRect(o.x + 1, 0, o.w - 2, o.gapTop);
+  // bottom bar
+  ctx.fillRect(o.x, o.gapBottom, o.w, CONFIG.LOGICAL_H - o.gapBottom);
+  ctx.strokeRect(o.x + 1, o.gapBottom, o.w - 2, CONFIG.LOGICAL_H - o.gapBottom);
+}
+
+function drawWell() {
+  // faint interior grid lines
+  ctx.strokeStyle = CONFIG.GRID_LINE;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let c = 1; c < WELL_COLS; c++) {
+    const x = WELL_X + c * CELL;
+    ctx.moveTo(x, WELL_Y);
+    ctx.lineTo(x, WELL_B);
+  }
+  for (let r = 1; r < WELL_ROWS; r++) {
+    const y = WELL_Y + r * CELL;
+    ctx.moveTo(WELL_X, y);
+    ctx.lineTo(WELL_R, y);
+  }
+  ctx.stroke();
+
+  // border on top, right, bottom (left edge stays open for entry)
+  ctx.strokeStyle = CONFIG.INK;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(WELL_X, WELL_Y);
+  ctx.lineTo(WELL_R, WELL_Y);
+  ctx.lineTo(WELL_R, WELL_B);
+  ctx.lineTo(WELL_X, WELL_B);
+  ctx.stroke();
+}
+
+function drawCell(x, y, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, CELL, CELL);
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, CELL - 1, CELL - 1);
+}
+
+function drawStack() {
+  for (let r = 0; r < WELL_ROWS; r++) {
+    if (!game.grid[r]) continue;
+    for (let c = 0; c < WELL_COLS; c++) {
+      const color = game.grid[r][c];
+      if (color) drawCell(WELL_X + c * CELL, WELL_Y + r * CELL, color);
+    }
+  }
+}
+
+function drawGhost() {
+  const cells = ghostCells();
+  if (!cells) return;
+  const color = SHAPES[game.piece.shapeIndex].color;
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.14;
+  for (const cell of cells) ctx.fillRect(WELL_X + cell.c * CELL, WELL_Y + cell.r * CELL, CELL, CELL);
+  ctx.globalAlpha = 0.55;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 3]);
+  for (const cell of cells) ctx.strokeRect(WELL_X + cell.c * CELL + 1.5, WELL_Y + cell.r * CELL + 1.5, CELL - 3, CELL - 3);
+  ctx.restore();
+}
+
+function drawClearFlash() {
+  if (game.flashRows.length === 0) return;
+  const t = (performance.now() - game.flashAt) / CONFIG.FLASH_MS;
+  if (t >= 1) { game.flashRows = []; return; }
+  ctx.save();
+  ctx.globalAlpha = 0.65 * (1 - t);
+  ctx.fillStyle = CONFIG.INK;
+  for (const r of game.flashRows) ctx.fillRect(WELL_X, WELL_Y + r * CELL, WELL_W, CELL);
+  ctx.restore();
+}
+
+function addFloater(x, y, text) {
+  game.floaters.push({ x: x, y: y, text: text, at: performance.now() });
+  if (game.floaters.length > 8) game.floaters.shift();
+}
+
+function drawFloaters() {
+  if (game.floaters.length === 0) return;
+  const now = performance.now();
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 18px ui-monospace, Menlo, Consolas, monospace';
+  game.floaters = game.floaters.filter(f => {
+    const t = (now - f.at) / CONFIG.FLOATER_MS;
+    if (t >= 1) return false;
+    ctx.globalAlpha = 1 - t;
+    ctx.fillStyle = CONFIG.INK;
+    ctx.fillText(f.text, f.x, f.y - 26 * t);
+    return true;
+  });
+  ctx.restore();
+}
+
+function drawHitFlash() {
+  if (!game.hitAt) return;
+  const t = (performance.now() - game.hitAt) / CONFIG.HIT_FLASH_MS;
+  if (t >= 1) return;
+  ctx.save();
+  ctx.globalAlpha = 0.26 * (1 - t);
+  ctx.fillStyle = CONFIG.HEART;
+  ctx.fillRect(0, 0, CONFIG.LOGICAL_W, CONFIG.LOGICAL_H);
+  ctx.restore();
+}
+
+function shake(mag) {
+  game.shakeMag = mag;
+  game.shakeAt = performance.now();
+}
+
+function spawnBurst(x, y, color, count, speed) {
+  if (!color) return;
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = speed * (0.4 + Math.random() * 0.8);
+    game.particles.push({
+      x: x, y: y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 70,
+      size: 3 + Math.random() * 4,
+      color: color,
+      life: 0.45 + Math.random() * 0.3,
+      age: 0,
+    });
+  }
+  while (game.particles.length > 220) game.particles.shift();
+}
+
+// Debris integrates on render time so it keeps falling on any screen,
+// including the game over overlay.
+function drawParticles() {
+  if (game.particles.length === 0) { game.lastParticleT = 0; return; }
+  const now = performance.now();
+  const dt = game.lastParticleT ? Math.min(0.05, (now - game.lastParticleT) / 1000) : 0.016;
+  game.lastParticleT = now;
+  game.particles = game.particles.filter(pt => {
+    pt.age += dt;
+    if (pt.age >= pt.life) return false;
+    pt.vy += 520 * dt;
+    pt.x += pt.vx * dt;
+    pt.y += pt.vy * dt;
+    ctx.globalAlpha = 1 - pt.age / pt.life;
+    ctx.fillStyle = pt.color;
+    ctx.fillRect(pt.x - pt.size / 2, pt.y - pt.size / 2, pt.size, pt.size);
+    return true;
+  });
+  ctx.globalAlpha = 1;
+}
+
+function drawCellScaled(x, y, color, sx, sy) {
+  const w = CELL * sx, h = CELL * sy;
+  const ox = x + (CELL - w) / 2, oy = y + (CELL - h) / 2;
+  ctx.fillStyle = color;
+  ctx.fillRect(ox, oy, w, h);
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(ox + 0.5, oy + 0.5, w - 1, h - 1);
+}
+
+// The flying piece gets two render-only touches: a short tween between
+// rotation or hold states, and a squash pulse on each flap. Physics and
+// collision always use the true block positions.
+function drawPiece() {
+  if (!game.piece) return;
+  const p = game.piece;
+  const color = SHAPES[p.shapeIndex].color;
+  let blocks = blocksOf(p);
+  const ra = game.rotAnim;
+  if (ra) {
+    const t = (performance.now() - ra.at) / CONFIG.ROT_ANIM_MS;
+    if (t >= 1) {
+      game.rotAnim = null;
+    } else {
+      const e = 1 - (1 - t) * (1 - t);
+      blocks = blocks.map((b, i) => ({
+        x: ra.from[i].x + (b.x - ra.from[i].x) * e,
+        y: ra.from[i].y + (b.y - ra.from[i].y) * e,
+      }));
+    }
+  }
+  let sx = 1, sy = 1;
+  if (game.flapAt) {
+    const t = (performance.now() - game.flapAt) / CONFIG.SQUASH_MS;
+    if (t < 1) {
+      const k = 1 - t;
+      sy = 1 - 0.16 * k;
+      sx = 1 + 0.12 * k;
+    }
+  }
+  for (const b of blocks) drawCellScaled(b.x, b.y, color, sx, sy);
+}
+
+function drawHUD() {
+  ctx.fillStyle = CONFIG.INK;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold 22px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('SCORE ' + game.score, 24, 22);
+  ctx.fillText('LINES ' + game.lines, 24, 50);
+  ctx.font = 'bold 16px ui-monospace, Menlo, Consolas, monospace';
+  const bestShown = game.mode === 'daily' ? game.dailyBest : game.best;
+  ctx.fillText('BEST ' + bestShown, 24, 82);
+  let tagY = 104;
+  if (game.mode === 'daily') {
+    ctx.font = 'bold 12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillText('DAILY ' + dailyDateStr(), 24, tagY);
+    tagY += 16;
+  }
+  if (game.combo >= 2) {
+    const mult = Math.min(CONFIG.COMBO_MAX_MULT, 1 + CONFIG.COMBO_STEP * (game.combo - 1));
+    ctx.fillStyle = CONFIG.HEART;
+    ctx.font = 'bold 15px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillText('COMBO x' + mult.toFixed(1), 24, tagY);
+    ctx.fillStyle = CONFIG.INK;
+  }
+
+  drawHearts();
+
+  ctx.fillStyle = CONFIG.INK;
+  ctx.font = 'bold 15px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('NEXT', 24, 168);
+  for (let i = 0; i < game.nextQueue.length; i++) {
+    drawMini(game.nextQueue[i], 24, 190 + i * 42, 13, false);
+  }
+
+  ctx.fillStyle = CONFIG.INK;
+  ctx.font = 'bold 15px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('HOLD', 24, 320);
+  if (game.hold !== null) drawMini(game.hold, 24, 342, 13, !game.canHold);
+
+  if (audio.muted) {
+    ctx.fillStyle = CONFIG.INK;
+    ctx.globalAlpha = 0.5;
+    ctx.font = 'bold 12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillText('SOUND OFF (M)', 24, 512);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawMini(shapeIndex, x, y, s, dim) {
+  const nr = SHAPES[shapeIndex].rotations[0];
+  ctx.globalAlpha = dim ? 0.35 : 1;
+  ctx.fillStyle = SHAPES[shapeIndex].color;
+  for (const o of nr.cells) ctx.fillRect(x + o.dx * s, y + o.dy * s, s - 2, s - 2);
+  ctx.globalAlpha = 1;
+}
+
+// Lives display: available hearts are filled bright, spent ones are dim
+// outlines, so the remaining count reads at a glance.
+function drawHearts() {
+  const s = 17;
+  const cy = 146;
+  for (let i = 0; i < CONFIG.LIVES_MAX; i++) {
+    const cx = 33 + i * 26;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + s * 0.35);
+    ctx.bezierCurveTo(cx - s * 0.55, cy + s * 0.02, cx - s * 0.45, cy - s * 0.45, cx, cy - s * 0.12);
+    ctx.bezierCurveTo(cx + s * 0.45, cy - s * 0.45, cx + s * 0.55, cy + s * 0.02, cx, cy + s * 0.35);
+    ctx.closePath();
+    if (i < game.lives) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = CONFIG.HEART;
+      ctx.fill();
+    } else {
+      ctx.globalAlpha = 0.25;
+      ctx.strokeStyle = CONFIG.HEART;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawOverlayPanel() {
+  ctx.fillStyle = 'rgba(20,25,34,0.82)';
+  ctx.fillRect(0, 0, CONFIG.LOGICAL_W, CONFIG.LOGICAL_H);
+}
+
+function drawStartOverlay() {
+  drawOverlayPanel();
+  ctx.fillStyle = CONFIG.INK;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 72px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('FLAPSTACK', CONFIG.LOGICAL_W / 2, 180);
+  ctx.font = '19px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('Space or Click: Flap      R or Up: Rotate      Shift or H: Hold', CONFIG.LOGICAL_W / 2, 262);
+  ctx.fillText('P: Pause      M: Sound      D: Mode', CONFIG.LOGICAL_W / 2, 294);
+  ctx.font = 'bold 19px ui-monospace, Menlo, Consolas, monospace';
+  const modeText = game.mode === 'daily'
+    ? 'Mode: DAILY ' + dailyDateStr() + '   best ' + game.dailyBest
+    : 'Mode: FREE PLAY';
+  ctx.fillText(modeText + '   (D to switch)', CONFIG.LOGICAL_W / 2, 344);
+  ctx.font = 'bold 22px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('Press Space to start', CONFIG.LOGICAL_W / 2, 400);
+}
+
+function drawGameOverOverlay() {
+  drawOverlayPanel();
+  ctx.fillStyle = CONFIG.INK;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 64px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('GAME OVER', CONFIG.LOGICAL_W / 2, 170);
+  ctx.font = '24px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('Score ' + game.score + '     Lines ' + game.lines, CONFIG.LOGICAL_W / 2, 246);
+  ctx.font = 'bold 20px ui-monospace, Menlo, Consolas, monospace';
+  const bestShown = game.mode === 'daily' ? game.dailyBest : game.best;
+  const bestLabel = game.mode === 'daily' ? 'DAILY BEST ' : 'BEST ';
+  if (game.newBest) {
+    ctx.fillStyle = CONFIG.HEART;
+    ctx.fillText('NEW ' + bestLabel + bestShown + '!', CONFIG.LOGICAL_W / 2, 290);
+    ctx.fillStyle = CONFIG.INK;
+  } else {
+    ctx.fillText(bestLabel + bestShown, CONFIG.LOGICAL_W / 2, 290);
+  }
+  const t = Math.floor(game.playTime);
+  const clock = Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0');
+  ctx.font = '17px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('Pieces ' + game.stats.pieces + '     Passes ' + game.stats.passes +
+               '     Best combo x' + game.stats.bestCombo.toFixed(1) + '     Time ' + clock,
+               CONFIG.LOGICAL_W / 2, 334);
+  ctx.font = 'bold 22px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('Press Space to restart', CONFIG.LOGICAL_W / 2, 392);
+  ctx.font = '16px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('D: switch mode', CONFIG.LOGICAL_W / 2, 428);
+}
+
+function drawPauseOverlay() {
+  drawOverlayPanel();
+  ctx.fillStyle = CONFIG.INK;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 56px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('PAUSED', CONFIG.LOGICAL_W / 2, 230);
+  ctx.font = 'bold 20px ui-monospace, Menlo, Consolas, monospace';
+  ctx.fillText('Press P to resume', CONFIG.LOGICAL_W / 2, 300);
+}
+
+function render() {
+  // letterbox: clear the whole backing store to black first
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // logical coordinate transform (dpr * fit-scale, letterbox offset)
+  ctx.setTransform(view.s, 0, 0, view.s, view.tx, view.ty);
+
+  // playfield background
+  ctx.fillStyle = CONFIG.BG;
+  ctx.fillRect(0, 0, CONFIG.LOGICAL_W, CONFIG.LOGICAL_H);
+
+  // screen shake nudges everything drawn after the background
+  const sht = (performance.now() - game.shakeAt) / CONFIG.SHAKE_MS;
+  if (sht < 1) {
+    const m = game.shakeMag * (1 - sht);
+    ctx.translate((Math.random() * 2 - 1) * m, (Math.random() * 2 - 1) * m);
+  }
+
+  if (game.state !== 'START') {
+    drawObstacle();
+  }
+  drawWell();
+  drawStack();
+  drawClearFlash();
+  if (game.state === 'FLYING' || game.state === 'PAUSED') drawGhost();
+  if (game.state !== 'START') {
+    drawPiece();
+    drawHUD();
+    drawFloaters();
+    drawParticles();
+    drawHitFlash();
+  }
+  if (game.state === 'START') drawStartOverlay();
+  else if (game.state === 'PAUSED') drawPauseOverlay();
+  else if (game.state === 'GAMEOVER') drawGameOverOverlay();
+}
+
+// ---------------------------------------------------------------------------
+// Main loop: fixed-timestep accumulator, render every frame
+// ---------------------------------------------------------------------------
+
+let lastTime = null;
+let accumulator = 0;
+const STEP_MS = 1000 / 60;
+
+function frame(now) {
+  if (lastTime === null) lastTime = now;
+  let dt = now - lastTime;
+  lastTime = now;
+  if (dt > 250) dt = 250; // avoid a spiral of death after a tab stall
+
+  if (game.state === 'FLYING') {
+    accumulator += dt;
+    while (accumulator >= STEP_MS) {
+      step(STEP_MS / 1000);
+      accumulator -= STEP_MS;
+      if (game.state !== 'FLYING') { accumulator = 0; break; }
+    }
+  } else {
+    accumulator = 0;
+  }
+
+  render();
+  requestAnimationFrame(frame);
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+function primaryAction() {
+  if (game.state === 'START') {
+    startRun();
+  } else if (game.state === 'FLYING') {
+    flap();
+  } else if (game.state === 'GAMEOVER') {
+    if (performance.now() - game.gameOverAt >= CONFIG.GAMEOVER_LOCKOUT) startRun();
+  }
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    primaryAction();
+  } else if (e.key === 'r' || e.key === 'R' || e.code === 'ArrowUp') {
+    e.preventDefault();
+    tryRotate();
+  } else if (e.key === 'p' || e.key === 'P' || e.code === 'KeyP') {
+    e.preventDefault();
+    if (game.state === 'FLYING') game.state = 'PAUSED';
+    else if (game.state === 'PAUSED') game.state = 'FLYING';
+  } else if (e.key === 'h' || e.key === 'H' || e.key === 'Shift') {
+    e.preventDefault();
+    tryHold();
+  } else if (e.key === 'm' || e.key === 'M') {
+    e.preventDefault();
+    toggleMute();
+  } else if (e.key === 'd' || e.key === 'D') {
+    e.preventDefault();
+    toggleMode();
+  }
+});
+
+// Losing window focus mid-flight pauses automatically so the piece is not
+// left falling unattended.
+window.addEventListener('blur', () => {
+  if (game.state === 'FLYING') game.state = 'PAUSED';
+});
+
+canvas.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  canvas.focus();
+  primaryAction();
+});
+
+window.addEventListener('resize', resize);
+
+// ---------------------------------------------------------------------------
+// Debug hooks for QA
+// ---------------------------------------------------------------------------
+
+window.__game = {
+  get state() { return game.state; },
+  get grid() { return game.grid; },
+  get score() { return game.score; },
+  get lines() { return game.lines; },
+  get piece() { return game.piece; },
+  get lockEvents() { return game.lockEvents; },
+  get scrollSpeed() { return game.scrollSpeed; },
+  get ghost() { return ghostCells(); },
+  get lives() { return game.lives; },
+  get best() { return game.best; },
+  get dailyBest() { return game.dailyBest; },
+  get settling() { return !!game.settle; },
+  get obstacleGap() { return game.obstacleGap; },
+  get nextQueue() { return game.nextQueue.slice(); },
+  get hold() { return game.hold; },
+  get canHold() { return game.canHold; },
+  get combo() { return game.combo; },
+  get mode() { return game.mode; },
+  get stats() { return game.stats; },
+  get obstacle() { return game.obstacle; },
+  get playTime() { return game.playTime; },
+  get muted() { return audio.muted; },
+  holdSwap: tryHold,
+  toggleMode: toggleMode,
+  toggleMute: toggleMute,
+  get config() { return CONFIG; },
+  flap: flap,
+  rotate: tryRotate,
+  start: startRun,
+  // Fill a row leaving one column empty so a piece can complete and clear it.
+  debugFillRow(row, skipCol) {
+    for (let c = 0; c < WELL_COLS; c++) {
+      if (c !== skipCol) game.grid[row][c] = '#8A8F98';
+    }
+  },
+  // QA-only helpers for deterministic tests (not used by normal play).
+  step: step,
+  forceLock: lockPiece,
+  setPiece(shapeIndex, rot, ox, oy, vy) {
+    game.piece = { shapeIndex, rot, ox, oy, vy: vy || 0 };
+  },
+  wellRect() { return { x: WELL_X, y: WELL_Y, r: WELL_R, b: WELL_B, cell: CELL, cols: WELL_COLS, rows: WELL_ROWS }; },
+};
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
