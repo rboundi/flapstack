@@ -103,6 +103,7 @@ const CONFIG = {
 
   DANGER_ROWS: 5,         // warn when the stack reaches the top N rows
   RESUME_MS: 1500,        // unpause countdown length
+  DEATH_BEAT_MS: 450,     // hold on the final crash before the overlay fades in
 
   SETTLE_DROP: 1100,      // px/s vertical glide of the wall landing
   SETTLE_SLIDE: 320,      // px/s horizontal align of the wall landing
@@ -126,6 +127,9 @@ const CONFIG = {
 
 // single source for the HUD/UI typeface stack; sizes are prepended per use
 const MONO = 'ui-monospace, Menlo, Consolas, monospace';
+
+// pristine copy of the constants, for the tuning panel's diff and reset
+const CONFIG_DEFAULTS = JSON.parse(JSON.stringify(CONFIG));
 
 // Piece colors assigned exactly as specified. Letters are shape ids only.
 const BASE_SHAPES = [
@@ -227,6 +231,7 @@ const game = {
   settle: null,          // { tx, ty } while gliding into a wall landing
   gameOverAt: 0,
   hitAt: 0,              // timestamp of the last life loss, for the red flash
+  respawnAt: 0,          // timestamp of the last respawn, for the blink telegraph
   flashRows: [],         // rows highlighted briefly after a clear
   flashAt: 0,
   floaters: [],          // rising score popups: { x, y, text, at }
@@ -257,8 +262,8 @@ function hashStr(s) {
   return h >>> 0;
 }
 
-function dailyDateStr() {
-  const d = new Date();
+function dailyDateStr(d) {
+  d = d || new Date();
   const mm = String(d.getMonth() + 1).padStart(2, '0');
   const dd = String(d.getDate()).padStart(2, '0');
   return d.getFullYear() + '-' + mm + '-' + dd;
@@ -310,6 +315,45 @@ try {
 } catch (e) {}
 function saveLife() {
   lsSet('flapstack.life', JSON.stringify(life));
+}
+
+// daily streak: consecutive calendar days with at least one daily run
+let streakN = 0;
+function loadStreak() {
+  try {
+    const s = JSON.parse(lsGet('flapstack.streak') || '{"last":"","n":0}');
+    return { last: String(s.last || ''), n: s.n | 0 };
+  } catch (e) { return { last: '', n: 0 }; }
+}
+function bumpStreak() {
+  const s = loadStreak();
+  const today = dailyDateStr();
+  if (s.last !== today) {
+    const yesterday = dailyDateStr(new Date(Date.now() - 86400000));
+    s.n = s.last === yesterday ? s.n + 1 : 1;
+    s.last = today;
+    lsSet('flapstack.streak', JSON.stringify(s));
+  }
+  streakN = s.n;
+}
+streakN = loadStreak().n;
+
+// last five finished runs, newest first, replayable by seed
+let runHistory = [];
+try {
+  runHistory = JSON.parse(lsGet('flapstack.history') || '[]');
+  if (!Array.isArray(runHistory)) runHistory = [];
+} catch (e) { runHistory = []; }
+function pushHistory() {
+  runHistory.unshift({
+    score: game.score,
+    lines: game.lines,
+    seed: game.lastSeed,
+    mode: game.mode,
+    date: dailyDateStr(),
+  });
+  if (runHistory.length > 5) runHistory.length = 5;
+  lsSet('flapstack.history', JSON.stringify(runHistory));
 }
 
 // letter overlay for colorblind support: shape initial per block color
@@ -446,6 +490,12 @@ function blocksOf(p) {
 }
 
 function newObstacles() {
+  // zen practice: an empty flight zone, nothing to crash into
+  if (game.mode === 'zen') {
+    game.obstacles = [];
+    game.obstacleEdge = 0;
+    return;
+  }
   const gap = game.obstacleGap;
   const minTop = CONFIG.OBSTACLE_MARGIN;
   const maxTop = CONFIG.LOGICAL_H - gap - CONFIG.OBSTACLE_MARGIN;
@@ -524,6 +574,7 @@ function startRun() {
   game.particles = [];
   game.settle = null;
   game.hitAt = 0;
+  game.respawnAt = 0;
   newBag();
   game.nextQueue = [];
   for (let i = 0; i < CONFIG.NEXT_COUNT; i++) game.nextQueue.push(nextFromBag());
@@ -531,13 +582,33 @@ function startRun() {
   game.state = 'FLYING';
 }
 
+// copy a shareable one-line result to the clipboard (S on the game over screen)
+function copyResult() {
+  if (game.state !== 'GAMEOVER') return;
+  let text = 'Flapstack  score ' + game.score + '  lines ' + game.lines +
+    '  combo x' + game.stats.bestCombo.toFixed(1) + '  time ' + fmtClock(game.playTime);
+  if (game.mode === 'daily') text += '  daily ' + dailyDateStr();
+  else text += '  replay: ' + location.origin + location.pathname + '#seed=' + game.lastSeed;
+  const fx = CONFIG.LOGICAL_W / 2;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => addFloater(fx, 120, 'COPIED!'),
+      () => addFloater(fx, 120, 'COPY FAILED')
+    );
+  } else {
+    addFloater(fx, 120, 'COPY UNAVAILABLE');
+  }
+}
+
 // Daily mode reruns the same seeded sequence for everyone on the same date;
-// seed mode (via a #seed= URL) replays one specific run. Toggling is only
-// allowed between runs and cycles free -> daily -> seed (when present).
+// seed mode (via a #seed= URL) replays one specific run; zen is pipeless,
+// deathless practice. Toggling is only allowed between runs and cycles
+// free -> daily -> seed (when present) -> zen -> free.
 function toggleMode() {
   if (game.state !== 'START' && game.state !== 'GAMEOVER') return;
   if (game.mode === 'free') game.mode = 'daily';
-  else if (game.mode === 'daily') game.mode = game.customSeed !== null ? 'seed' : 'free';
+  else if (game.mode === 'daily') game.mode = game.customSeed !== null ? 'seed' : 'zen';
+  else if (game.mode === 'seed') game.mode = 'zen';
   else game.mode = 'free';
   if (game.mode === 'daily') loadDailyBest();
 }
@@ -548,8 +619,8 @@ function gameOver() {
   game.gameOverAt = performance.now();
   SFX.gameOver();
   shake(9);
-  // seed-mode replays do not touch the records
-  if (game.mode !== 'seed' && game.score > game.best) {
+  // seed replays and zen practice do not touch the records
+  if ((game.mode === 'free' || game.mode === 'daily') && game.score > game.best) {
     game.best = game.score;
     if (game.mode === 'free') game.newBest = true;
     lsSet('flapstack.best', String(game.best));
@@ -564,13 +635,15 @@ function gameOver() {
   life.allClears += game.stats.allClears;
   if (game.playTime > life.bestTime) life.bestTime = game.playTime;
   saveLife();
+  if (game.mode === 'daily') bumpStreak();
+  pushHistory();
 }
 
 // Losing a life forfeits the current piece and launches a fresh flight; the
 // run only ends when no hearts remain. Topping out ends the run outright.
 function loseLife() {
   if (game.state !== 'FLYING') return;
-  game.lives -= 1;
+  if (game.mode !== 'zen') game.lives -= 1; // zen practice never costs hearts
   game.combo = 0;
   game.hitAt = performance.now();
   if (game.piece) {
@@ -583,6 +656,7 @@ function loseLife() {
   SFX.hit();
   if (game.lives <= 0) { gameOver(); return; }
   spawnPiece();
+  game.respawnAt = performance.now();
 }
 
 function flap() {
@@ -661,16 +735,35 @@ function recenterCandidate(p, shapeIndex, rotIndex) {
   };
 }
 
+// Kick offsets tried in order when the centered position does not fit:
+// sideways first (half cell, then a full cell), then up, then down. Small
+// nudges make rotation and hold succeed in cramped spots instead of
+// silently doing nothing, without letting a piece hop through geometry.
+const KICK_OFFSETS = [
+  [0, 0],
+  [-CELL / 2, 0], [CELL / 2, 0], [-CELL, 0], [CELL, 0],
+  [0, -CELL / 2], [0, -CELL], [0, CELL / 2], [0, CELL],
+];
+
+function findFit(p, shapeIndex, rotIndex) {
+  const base = recenterCandidate(p, shapeIndex, rotIndex);
+  for (const off of KICK_OFFSETS) {
+    const cand = base.candidate.map(b => ({ x: b.x + off[0], y: b.y + off[1] }));
+    if (rotationValid(cand)) return { nox: base.nox + off[0], noy: base.noy + off[1] };
+  }
+  return null;
+}
+
 function tryRotate() {
   if (game.state !== 'FLYING' || !game.piece || game.settle) return;
   const p = game.piece;
   const nextRot = (p.rot + 1) % 4;
-  const cand = recenterCandidate(p, p.shapeIndex, nextRot);
-  if (rotationValid(cand.candidate)) {
+  const fit = findFit(p, p.shapeIndex, nextRot);
+  if (fit) {
     game.rotAnim = { from: blocksOf(p), at: performance.now() };
     p.rot = nextRot;
-    p.ox = cand.nox;
-    p.oy = cand.noy;
+    p.ox = fit.nox;
+    p.oy = fit.noy;
     SFX.rotate();
   }
 }
@@ -683,8 +776,8 @@ function tryHold() {
   if (game.state !== 'FLYING' || !game.piece || game.settle || !game.canHold) return;
   const p = game.piece;
   const incoming = game.hold !== null ? game.hold : game.nextQueue[0];
-  const cand = recenterCandidate(p, incoming, 0);
-  if (!rotationValid(cand.candidate)) return;
+  const fit = findFit(p, incoming, 0);
+  if (!fit) return;
   game.rotAnim = { from: blocksOf(p), at: performance.now() };
   if (game.hold === null) {
     game.nextQueue.shift();
@@ -693,8 +786,8 @@ function tryHold() {
   game.hold = p.shapeIndex;
   p.shapeIndex = incoming;
   p.rot = 0;
-  p.ox = cand.nox;
-  p.oy = cand.noy;
+  p.ox = fit.nox;
+  p.oy = fit.noy;
   game.canHold = false;
   SFX.hold();
 }
@@ -903,23 +996,39 @@ function lockPiece(viaSettle) {
   }
 
   // rising pressure: on a steady cadence a garbage row pushes the stack up
-  if (game.stats.pieces >= CONFIG.RISE_START && locksUntilRise() === CONFIG.RISE_EVERY) {
+  if (game.mode !== 'zen' &&
+      game.stats.pieces >= CONFIG.RISE_START && locksUntilRise() === CONFIG.RISE_EVERY) {
     raiseGarbageRow();
     if (game.state !== 'FLYING') return;
   }
 
-  // top-out: blocks in the top 2 rows end the run outright, hearts or not
+  // top-out: blocks in the top 2 rows end the run outright, hearts or not.
+  // In zen practice the well is swept clean instead and play continues.
   const stackTop = topOccupiedRow();
-  if (stackTop < 2) { gameOver(); return; }
+  if (stackTop < 2) {
+    if (game.mode === 'zen') {
+      game.grid = makeEmptyGrid();
+      game.flashRows = [];
+      for (let r = 0; r < WELL_ROWS; r++) game.flashRows.push(r);
+      game.flashAt = performance.now();
+      shake(5);
+      SFX.allClear();
+    } else {
+      gameOver();
+      return;
+    }
+  }
 
   // danger warning when the stack reaches the top rows
   const wasDanger = game.danger;
   game.danger = stackTop < CONFIG.DANGER_ROWS;
   if (game.danger && !wasDanger) SFX.warn();
 
-  // difficulty ramp, then next flight
-  game.scrollSpeed = Math.min(CONFIG.SCROLL_MAX, game.scrollSpeed + CONFIG.SCROLL_INC);
-  game.obstacleGap = Math.max(CONFIG.GAP_MIN, game.obstacleGap - CONFIG.GAP_SHRINK);
+  // difficulty ramp (zen stays at a fixed, gentle pace), then next flight
+  if (game.mode !== 'zen') {
+    game.scrollSpeed = Math.min(CONFIG.SCROLL_MAX, game.scrollSpeed + CONFIG.SCROLL_INC);
+    game.obstacleGap = Math.max(CONFIG.GAP_MIN, game.obstacleGap - CONFIG.GAP_SHRINK);
+  }
   spawnPiece();
 }
 
@@ -1359,8 +1468,16 @@ function drawPiece() {
       sx = 1 + 0.12 * k;
     }
   }
+  // respawn telegraph: the fresh piece blinks briefly after a lost heart
+  let alpha = 1;
+  if (game.respawnAt) {
+    const t = (performance.now() - game.respawnAt) / 600;
+    if (t < 1) alpha = 0.5 + 0.35 * Math.sin(performance.now() * 0.03);
+  }
+  ctx.globalAlpha = alpha;
   beginLetterBatch();
   for (const b of blocks) drawCellScaled(b.x, b.y, color, sx, sy);
+  ctx.globalAlpha = 1;
 }
 
 function drawHUD() {
@@ -1379,6 +1496,7 @@ function drawHUD() {
   ctx.font = 'bold 12px ' + MONO;
   if (game.mode === 'daily') { ctx.fillText('DAILY ' + dailyDateStr(), 24, tagY); tagY += 16; }
   else if (game.mode === 'seed') { ctx.fillText('SEED ' + game.lastSeed, 24, tagY); tagY += 16; }
+  else if (game.mode === 'zen') { ctx.fillText('ZEN PRACTICE', 24, tagY); tagY += 16; }
   if (game.combo >= 2) {
     const mult = Math.min(CONFIG.COMBO_MAX_MULT, 1 + CONFIG.COMBO_STEP * (game.combo - 1));
     ctx.fillStyle = CONFIG.HEART;
@@ -1389,7 +1507,7 @@ function drawHUD() {
 
   // rising row countdown, shown above the well when close
   const untilRise = locksUntilRise();
-  if (untilRise <= 3) {
+  if (game.mode !== 'zen' && untilRise <= 3) {
     ctx.save();
     ctx.fillStyle = CONFIG.HEART;
     ctx.font = 'bold 14px ' + MONO;
@@ -1459,6 +1577,37 @@ function drawOverlayPanel() {
   ctx.fillRect(0, 0, CONFIG.LOGICAL_W, CONFIG.LOGICAL_H);
 }
 
+// a few pieces drifting behind the title so the first screen has life
+const titleDrift = { items: [], lastT: 0 };
+function drawTitleDrift() {
+  if (titleDrift.items.length === 0) {
+    for (let i = 0; i < 8; i++) {
+      titleDrift.items.push({
+        idx: i % 7,
+        x: Math.random() * CONFIG.LOGICAL_W,
+        y: 50 + Math.random() * 440,
+        sp: 8 + Math.random() * 16,
+        s: 16 + Math.random() * 12,
+      });
+    }
+  }
+  const now = performance.now();
+  const dt = titleDrift.lastT ? Math.min(0.05, (now - titleDrift.lastT) / 1000) : 0.016;
+  titleDrift.lastT = now;
+  ctx.save();
+  ctx.globalAlpha = 0.22;
+  for (const it of titleDrift.items) {
+    if (!REDUCED_MOTION) {
+      it.x += it.sp * dt;
+      if (it.x > CONFIG.LOGICAL_W + 40) { it.x = -80; it.y = 50 + Math.random() * 440; }
+    }
+    const nr = SHAPES[it.idx].rotations[0];
+    ctx.fillStyle = SHAPES[it.idx].color;
+    for (const o of nr.cells) ctx.fillRect(it.x + o.dx * it.s, it.y + o.dy * it.s, it.s - 2, it.s - 2);
+  }
+  ctx.restore();
+}
+
 function drawStartOverlay() {
   drawOverlayPanel();
   ctx.fillStyle = CONFIG.INK;
@@ -1470,18 +1619,31 @@ function drawStartOverlay() {
   ctx.fillText('Space or Click: Flap      R or Up: Rotate      Shift or H: Hold', CONFIG.LOGICAL_W / 2, 262);
   ctx.fillText('P: Pause    M: Sound    N: Music    C: Letters    D: Mode    Esc: End run', CONFIG.LOGICAL_W / 2, 294);
   ctx.font = 'bold 19px ' + MONO;
-  const modeText = game.mode === 'daily' ? 'Mode: DAILY ' + dailyDateStr() + '   best ' + game.dailyBest
+  const modeText = game.mode === 'daily'
+    ? 'Mode: DAILY ' + dailyDateStr() + '   best ' + game.dailyBest +
+      (streakN > 0 ? '   streak ' + streakN : '')
     : game.mode === 'seed' ? 'Mode: SEED ' + game.customSeed
+    : game.mode === 'zen' ? 'Mode: ZEN PRACTICE (no pipes, no game over)'
     : 'Mode: FREE PLAY';
   ctx.fillText(modeText + '   (D to switch)', CONFIG.LOGICAL_W / 2, 344);
   ctx.font = 'bold 22px ' + MONO;
-  ctx.fillText('Press Space to start', CONFIG.LOGICAL_W / 2, 400);
+  ctx.fillText('Press Space to start', CONFIG.LOGICAL_W / 2, 396);
   if (life.games > 0) {
     ctx.font = '15px ' + MONO;
     const clock = fmtClock(life.bestTime);
     ctx.fillText('Lifetime   games ' + life.games + '   lines ' + life.lines +
                  '   all clears ' + life.allClears + '   longest ' + clock,
-                 CONFIG.LOGICAL_W / 2, 452);
+                 CONFIG.LOGICAL_W / 2, 440);
+  }
+  if (runHistory.length > 0) {
+    ctx.font = 'bold 12px ' + MONO;
+    ctx.fillText('Recent runs  (1-' + runHistory.length + ' to replay)', CONFIG.LOGICAL_W / 2, 464);
+    ctx.font = '12px ' + MONO;
+    for (let i = 0; i < runHistory.length; i++) {
+      const h = runHistory[i];
+      ctx.fillText((i + 1) + ')  ' + h.score + ' pts   ' + h.lines + ' lines   ' +
+                   h.mode + '   seed ' + h.seed, CONFIG.LOGICAL_W / 2, 482 + i * 12);
+    }
   }
 }
 
@@ -1512,7 +1674,7 @@ function drawGameOverOverlay() {
   ctx.font = 'bold 22px ' + MONO;
   ctx.fillText('Press Space to restart', CONFIG.LOGICAL_W / 2, 392);
   ctx.font = '16px ' + MONO;
-  ctx.fillText('D: switch mode', CONFIG.LOGICAL_W / 2, 428);
+  ctx.fillText('D: switch mode      S: copy result', CONFIG.LOGICAL_W / 2, 428);
   if (game.mode !== 'daily') {
     ctx.font = '14px ' + MONO;
     ctx.fillText('Seed ' + game.lastSeed + '   (open with #seed=' + game.lastSeed + ' to replay)',
@@ -1566,6 +1728,8 @@ function render() {
     ctx.translate((Math.random() * 2 - 1) * m, (Math.random() * 2 - 1) * m);
   }
 
+  if (game.state === 'START') drawTitleDrift();
+
   if (game.state !== 'START') {
     drawObstacle();
   }
@@ -1584,7 +1748,16 @@ function render() {
   if (game.state === 'START') drawStartOverlay();
   else if (game.state === 'PAUSED') drawPauseOverlay();
   else if (game.state === 'RESUMING') drawResumeOverlay();
-  else if (game.state === 'GAMEOVER') drawGameOverOverlay();
+  else if (game.state === 'GAMEOVER') {
+    // death beat: hold on the crash for a moment, then fade the overlay in
+    const t = performance.now() - game.gameOverAt;
+    if (t > CONFIG.DEATH_BEAT_MS) {
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, (t - CONFIG.DEATH_BEAT_MS) / 150);
+      drawGameOverOverlay();
+      ctx.restore();
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1646,9 +1819,111 @@ function primaryAction() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tuning panel (T): live sliders over the feel constants, with a copy-diff
+// button that emits ready-to-paste CONFIG lines. A dev tool for the feel
+// pass; entirely DOM-based so it never touches the render loop.
+// ---------------------------------------------------------------------------
+
+const TUNE_FIELDS = [
+  ['GRAVITY', 200, 1600, 10],
+  ['FLAP_VY', -520, -140, 5],
+  ['TERMINAL_VY', 200, 900, 10],
+  ['SCROLL_START', 40, 260, 5],
+  ['SCROLL_MAX', 100, 400, 5],
+  ['SCROLL_INC', 0, 15, 1],
+  ['WELL_SCROLL_FACTOR', 0.1, 1, 0.05],
+  ['DIVE_BRAKE', 0, 1, 0.05],
+  ['SETTLE_DROP', 300, 2000, 50],
+  ['GAP', 100, 280, 5],
+  ['GAP_MIN', 80, 220, 5],
+  ['GAP_SHRINK', 0, 8, 0.5],
+  ['RISE_START', 4, 40, 1],
+  ['RISE_EVERY', 2, 20, 1],
+];
+
+let tunePanel = null;
+function toggleTunePanel() {
+  if (tunePanel) { tunePanel.remove(); tunePanel = null; return; }
+  const el = document.createElement('div');
+  el.style.cssText = 'position:fixed;top:10px;right:10px;z-index:10;' +
+    'background:rgba(20,25,34,0.94);color:#EDE8DC;font:12px ' + MONO + ';' +
+    'padding:10px 12px;border:1px solid #39424E;border-radius:6px;' +
+    'max-height:92vh;overflow:auto;width:232px;';
+  const title = document.createElement('div');
+  title.textContent = 'TUNING (T to close)';
+  title.style.cssText = 'font-weight:bold;margin-bottom:8px;';
+  el.appendChild(title);
+  for (const f of TUNE_FIELDS) {
+    const key = f[0];
+    const row = document.createElement('div');
+    row.style.cssText = 'margin-bottom:6px;';
+    const label = document.createElement('div');
+    label.textContent = key + ' ';
+    const val = document.createElement('span');
+    val.textContent = String(CONFIG[key]);
+    val.style.cssText = 'float:right;';
+    label.appendChild(val);
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = f[1];
+    input.max = f[2];
+    input.step = f[3];
+    input.value = CONFIG[key];
+    input.style.cssText = 'width:100%;';
+    input.addEventListener('input', () => {
+      CONFIG[key] = parseFloat(input.value);
+      val.textContent = String(CONFIG[key]);
+    });
+    row.appendChild(label);
+    row.appendChild(input);
+    el.appendChild(row);
+  }
+  const btnCss = 'font:12px ' + MONO + ';margin-right:6px;background:#2b3444;' +
+    'color:#EDE8DC;border:1px solid #39424E;border-radius:4px;padding:3px 8px;cursor:pointer;';
+  const copyBtn = document.createElement('button');
+  copyBtn.textContent = 'copy diff';
+  copyBtn.style.cssText = btnCss;
+  copyBtn.addEventListener('click', () => {
+    const changed = [];
+    for (const f of TUNE_FIELDS) {
+      const k = f[0];
+      if (CONFIG[k] !== CONFIG_DEFAULTS[k]) changed.push('  ' + k + ': ' + CONFIG[k] + ',');
+    }
+    const text = changed.length ? changed.join('\n') : '(no changes)';
+    const done = (msg) => {
+      copyBtn.textContent = msg;
+      setTimeout(() => { copyBtn.textContent = 'copy diff'; }, 900);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => done('copied!'), () => done('copy failed'));
+    } else {
+      done('unavailable');
+    }
+  });
+  const resetBtn = document.createElement('button');
+  resetBtn.textContent = 'reset';
+  resetBtn.style.cssText = btnCss;
+  resetBtn.addEventListener('click', () => {
+    for (const f of TUNE_FIELDS) CONFIG[f[0]] = CONFIG_DEFAULTS[f[0]];
+    el.remove();
+    tunePanel = null;
+    toggleTunePanel();
+  });
+  const btns = document.createElement('div');
+  btns.appendChild(copyBtn);
+  btns.appendChild(resetBtn);
+  el.appendChild(btns);
+  document.body.appendChild(el);
+  tunePanel = el;
+}
+
 window.addEventListener('keydown', (e) => {
   // leave browser shortcuts alone (copy, reload, new window, ...)
   if (e.ctrlKey || e.metaKey || e.altKey) return;
+  // let the tuning panel's controls keep their own keyboard behavior
+  if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' ||
+                   e.target.tagName === 'TEXTAREA')) return;
   if (e.code === 'Space') {
     e.preventDefault();
     primaryAction();
@@ -1683,6 +1958,22 @@ window.addEventListener('keydown', (e) => {
   } else if (e.key === 'd' || e.key === 'D') {
     e.preventDefault();
     toggleMode();
+  } else if (e.key === 's' || e.key === 'S') {
+    e.preventDefault();
+    copyResult();
+  } else if (e.key === 't' || e.key === 'T') {
+    e.preventDefault();
+    toggleTunePanel();
+  } else if (e.key >= '1' && e.key <= '5') {
+    e.preventDefault();
+    if (game.state === 'START' || game.state === 'GAMEOVER') {
+      const h = runHistory[e.key.charCodeAt(0) - 49];
+      if (h) {
+        game.customSeed = h.seed >>> 0;
+        game.mode = h.mode === 'zen' ? 'zen' : 'seed';
+        startRun();
+      }
+    }
   } else if (e.key === 'Escape') {
     e.preventDefault();
     if (game.state === 'FLYING' || game.state === 'PAUSED' || game.state === 'RESUMING') gameOver();
@@ -1767,6 +2058,423 @@ window.__game = {
 
 resize();
 requestAnimationFrame(frame);
+
+// ---------------------------------------------------------------------------
+// In-page regression suite: open index.html?test=1 to run it. Drives the
+// game through window.__game exactly like external automation would, then
+// restores storage and constants and reports into a panel on the page plus
+// window.__testResults for scripts.
+// ---------------------------------------------------------------------------
+
+function runTestSuite() {
+  const G = window.__game;
+  const W = G.wellRect();
+  const DT = 1 / 60;
+  const savedStorage = {};
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf('flapstack') === 0) savedStorage[k] = localStorage.getItem(k);
+    }
+  } catch (e) {}
+  const savedConfig = JSON.parse(JSON.stringify(CONFIG));
+
+  const clearWell = () => {
+    for (let r = 0; r < W.rows; r++) for (let c = 0; c < W.cols; c++) G.grid[r][c] = null;
+  };
+  const press = (code, k, mods) => window.dispatchEvent(new KeyboardEvent('keydown',
+    Object.assign({ code: code, key: k, bubbles: true, cancelable: true }, mods || {})));
+  const runTo = (max) => {
+    const lk0 = G.lockEvents.length, lv0 = G.lives;
+    for (let s = 0; s < max; s++) {
+      G.step(DT);
+      if (G.lockEvents.length > lk0) return { locked: true, ev: G.lockEvents[G.lockEvents.length - 1] };
+      if (G.lives < lv0) return { lifeLost: true };
+      if (G.state === 'GAMEOVER') return { gameover: true };
+    }
+    return { timeout: true };
+  };
+  const ok = (cond, msg) => { if (!cond) throw new Error(msg); };
+  const toMode = (m) => { game.mode = m; if (m === 'daily') loadDailyBest(); };
+  const clearingLock = (col) => {
+    clearWell(); G.debugFillRow(15, col);
+    G.setPiece(0, 1, W.x + col * W.cell, W.b - 4 * W.cell - 1, 200);
+    const s0 = G.score; runTo(40); return G.score - s0;
+  };
+
+  const tests = [];
+  const T = (name, fn) => tests.push([name, fn]);
+
+  T('boot surface: obstacle null, no phantom pass', () => {
+    ok(G.obstacle === null, 'obstacle not null at boot');
+    G.setPiece(1, 0, 700, 250, 0);
+    const s0 = G.score;
+    for (let s = 0; s < 5; s++) G.step(DT);
+    ok(G.score - s0 === 0 && G.stats.passes === 0, 'phantom pass awarded');
+  });
+
+  T('seven shapes floor-lock +25, supported, on grid', () => {
+    for (let idx = 0; idx < 7; idx++) {
+      G.start(); clearWell();
+      G.setPiece(idx, 0, W.x + 2 * W.cell, W.b - 4 * W.cell + 2, 120);
+      const s0 = G.score;
+      const r = runTo(120);
+      ok(r.locked, 'shape ' + idx + ' did not lock');
+      ok(r.ev.supported, 'shape ' + idx + ' unsupported');
+      ok(r.ev.cells.every(c => Number.isInteger(c.c) && Number.isInteger(c.r)), 'shape ' + idx + ' off grid');
+      ok(G.score - s0 === 25, 'shape ' + idx + ' delta ' + (G.score - s0));
+    }
+  });
+
+  T('combo 125/175/225, barren 25 resets', () => {
+    G.start();
+    ok(clearingLock(5) === 125, 'first clear');
+    ok(clearingLock(6) === 175, 'second clear');
+    ok(clearingLock(7) === 225, 'third clear');
+    clearWell(); G.setPiece(1, 0, W.x + 2 * W.cell, W.b - 2 * W.cell - 3, 200);
+    const s0 = G.score; runTo(30);
+    ok(G.score - s0 === 25, 'barren delta ' + (G.score - s0));
+    ok(G.combo === 0, 'combo not reset');
+    ok(clearingLock(5) === 125, 'combo did not restart');
+  });
+
+  T('all-clear 625 and empty well', () => {
+    G.start(); clearWell();
+    for (let c = 0; c < W.cols; c++) if (c < 3 || c > 6) G.grid[15][c] = '#8A8F98';
+    G.setPiece(0, 0, W.x + 3 * W.cell, W.b - W.cell - 2, 200);
+    const s0 = G.score; const r = runTo(40);
+    ok(r.locked && G.score - s0 === 625, 'delta ' + (G.score - s0));
+    ok(G.grid.every(row => row.every(x => x === null)), 'well not empty');
+  });
+
+  T('wall settle +15, supported', () => {
+    G.start(); clearWell();
+    G.setPiece(1, 0, W.r - 2 * W.cell - 2, W.y + 4 * W.cell, -100);
+    const s0 = G.score; const r = runTo(200);
+    ok(r.locked && r.ev.supported && G.score - s0 === 15, 'settle failed');
+  });
+
+  T('side settle locks without heart loss', () => {
+    G.start(); clearWell();
+    for (let r = 0; r < W.rows; r++) G.grid[r][6] = '#8A8F98';
+    G.setPiece(0, 0, W.x + 1 * W.cell, W.y + 5 * W.cell, 0);
+    let res = null;
+    for (let s = 0; s < 300; s++) {
+      if (s % 6 === 0 && !G.settling) G.flap();
+      const lk = G.lockEvents.length; G.step(DT);
+      if (G.lockEvents.length > lk) { res = 'locked'; break; }
+      if (G.lives < 3) { res = 'died'; break; }
+    }
+    ok(res === 'locked', String(res));
+  });
+
+  T('entrance side-hit crashes', () => {
+    G.start(); clearWell();
+    for (let r = 8; r < W.rows; r++) G.grid[r][0] = '#888';
+    CONFIG.GRAVITY = 0;
+    G.setPiece(0, 0, W.x - 4 * W.cell - 10, W.y + 10 * W.cell, 0);
+    let res = null;
+    for (let s = 0; s < 300; s++) {
+      const lk = G.lockEvents.length; G.step(DT);
+      if (G.lockEvents.length > lk) { res = 'locked'; break; }
+      if (G.lives < 3) { res = 'died'; break; }
+    }
+    CONFIG.GRAVITY = savedConfig.GRAVITY;
+    ok(res === 'died', String(res));
+  });
+
+  T('well ceiling bumps instead of killing', () => {
+    G.start(); clearWell();
+    G.setPiece(1, 0, W.x + 3 * W.cell, W.y + 2 * W.cell, -600);
+    let minY = 999;
+    for (let s = 0; s < 40; s++) {
+      G.step(DT); minY = Math.min(minY, G.piece.oy);
+      if (G.state !== 'FLYING' || G.lives < 3) break;
+    }
+    ok(G.lives === 3 && G.state === 'FLYING' && minY >= W.y - 0.01, 'bump failed');
+  });
+
+  T('three crashes end the run', () => {
+    G.start(); clearWell();
+    for (let n = 0; n < 3; n++) { G.setPiece(2, 0, CONFIG.OBSTACLE_X + 5, 5, 0); runTo(30); }
+    ok(G.state === 'GAMEOVER' && G.lives === 0, G.lives + '/' + G.state);
+  });
+
+  T('top-out ends despite full hearts', () => {
+    G.start(); clearWell();
+    for (let r = 3; r < W.rows; r++) G.grid[r][4] = '#888';
+    G.setPiece(1, 0, W.x + 4 * W.cell, W.y + 1, 150);
+    let topped = false;
+    for (let s = 0; s < 60; s++) {
+      G.step(DT);
+      if (G.state === 'GAMEOVER') { topped = true; break; }
+      if (G.lives < 3) break;
+    }
+    ok(topped && G.lives === 3, 'lives ' + G.lives);
+  });
+
+  T('clear restores a heart, capped at 5', () => {
+    G.start(); clearWell();
+    G.setPiece(2, 0, CONFIG.OBSTACLE_X + 5, 5, 0); runTo(30);
+    ok(G.lives === 2, 'setup lives ' + G.lives);
+    clearingLock(5);
+    ok(G.lives === 3, 'heart not restored');
+    clearingLock(6); clearingLock(7); clearingLock(4);
+    ok(G.lives === 5, 'cap wrong: ' + G.lives);
+  });
+
+  T('garbage rises on cadence with one hole', () => {
+    G.start();
+    for (let n = 0; n < 12; n++) {
+      clearWell();
+      G.setPiece(1, 0, W.x + (n % 4) * 2 * W.cell, W.b - 2 * W.cell - 3, 220);
+      runTo(40);
+    }
+    const g = G.grid[15].filter(c => c === CONFIG.GARBAGE).length;
+    const holes = G.grid[15].filter(c => c === null).length;
+    ok(G.stats.pieces === 12 && g === 9 && holes === 1, g + ' garbage / ' + holes + ' holes');
+  });
+
+  T('rise into occupied top row is a top-out', () => {
+    G.start(); clearWell();
+    G.grid[0][3] = '#888';
+    CONFIG.RISE_START = G.stats.pieces + 1;
+    G.setPiece(1, 0, W.x + 5 * W.cell, W.b - 2 * W.cell - 3, 200);
+    let ended = false;
+    for (let s = 0; s < 40; s++) { G.step(DT); if (G.state === 'GAMEOVER') { ended = true; break; } }
+    CONFIG.RISE_START = savedConfig.RISE_START;
+    ok(ended, 'run did not end');
+  });
+
+  T('second pipe appears and collides', () => {
+    CONFIG.OBSTACLE2_START = 0;
+    G.start(); clearWell();
+    ok(G.obstacles.length === 2 && G.obstacles[1].x === CONFIG.OBSTACLE2_X, 'no second pipe');
+    G.setPiece(2, 0, CONFIG.OBSTACLE2_X + 5, 5, 0);
+    const r = runTo(30);
+    CONFIG.OBSTACLE2_START = savedConfig.OBSTACLE2_START;
+    ok(r.lifeLost, 'no collision with pipe 2');
+  });
+
+  T('clean pass +15 center, +10 edge', () => {
+    CONFIG.GRAVITY = 0;
+    G.start(); clearWell();
+    let ob = G.obstacles[0];
+    G.setPiece(1, 0, 150, (ob.gapTop + ob.gapBottom) / 2 - W.cell, 0);
+    let s0 = G.score;
+    for (let s = 0; s < 400; s++) { G.step(DT); if (G.stats.passes > 0 || G.lives < 3) break; }
+    const center = G.score - s0;
+    G.start(); clearWell();
+    ob = G.obstacles[0];
+    G.setPiece(1, 0, 150, ob.gapTop + 2, 0);
+    s0 = G.score;
+    for (let s = 0; s < 400; s++) { G.step(DT); if (G.stats.passes > 0 || G.lives < 3) break; }
+    const edge = G.score - s0;
+    CONFIG.GRAVITY = savedConfig.GRAVITY;
+    ok(center === 15 && edge === 10, center + '/' + edge);
+  });
+
+  T('clean pass fair while the gap drifts', () => {
+    CONFIG.GRAVITY = 0;
+    G.start(); clearWell();
+    for (const o of G.obstacles) { o.amp = 40; o.phase = 0; }
+    const ob = G.obstacles[0];
+    G.setPiece(1, 0, 150, (ob.gapTop + ob.gapBottom) / 2 - W.cell, 0);
+    const s0 = G.score;
+    for (let s = 0; s < 500; s++) {
+      G.piece.oy = (ob.gapTop + ob.gapBottom) / 2 - W.cell;
+      G.step(DT);
+      if (G.stats.passes > 0 || G.lives < 3) break;
+    }
+    CONFIG.GRAVITY = savedConfig.GRAVITY;
+    ok(G.score - s0 === 15, 'delta ' + (G.score - s0));
+  });
+
+  T('hold stashes, once per flight, swaps back', () => {
+    G.start(); clearWell();
+    const orig = G.piece.shapeIndex, incoming = G.nextQueue[0];
+    G.setPiece(orig, 0, 150, 250, 0);
+    press('KeyH', 'h');
+    ok(G.hold === orig && G.piece.shapeIndex === incoming && G.canHold === false, 'first hold');
+    press('KeyH', 'h');
+    ok(G.hold === orig && G.piece.shapeIndex === incoming, 'second hold not ignored');
+    clearWell();
+    G.setPiece(G.piece.shapeIndex, 0, W.x + 2 * W.cell, W.b - 2 * W.cell - 3, 200);
+    runTo(40);
+    ok(G.canHold === true, 'hold not recharged');
+    G.setPiece(G.piece.shapeIndex, 0, 150, 250, 0);
+    press('Shift', 'Shift');
+    ok(G.piece.shapeIndex === orig, 'swap back failed');
+  });
+
+  T('queue stays 3 deep', () => {
+    G.start();
+    ok(G.nextQueue.length === 3, 'boot queue');
+    clearWell();
+    G.setPiece(1, 0, W.x + 2 * W.cell, W.b - 2 * W.cell - 3, 200);
+    runTo(30);
+    ok(G.nextQueue.length === 3, 'after lock');
+  });
+
+  T('wall kick: blocked rotation succeeds shifted', () => {
+    G.start(); clearWell();
+    for (let r = 8; r < W.rows; r++) G.grid[r][7] = '#888';
+    G.setPiece(0, 1, W.x + 5 * W.cell, W.y + 10 * W.cell, 0);
+    const rot0 = G.piece.rot;
+    press('KeyR', 'r');
+    ok(G.piece.rot === (rot0 + 1) % 4, 'rotation stayed blocked');
+  });
+
+  T('zen: no pipes, no heart loss, top-out sweeps', () => {
+    toMode('zen');
+    G.start();
+    ok(G.obstacles.length === 0, 'pipes in zen');
+    clearWell();
+    G.setPiece(1, 0, 100, 460, 300);
+    for (let s = 0; s < 60; s++) G.step(DT);
+    ok(G.lives === 3, 'heart lost in zen');
+    clearWell();
+    for (let r = 3; r < W.rows; r++) G.grid[r][4] = '#888';
+    G.setPiece(1, 0, W.x + 4 * W.cell, W.y + 1, 150);
+    let swept = false;
+    for (let s = 0; s < 80; s++) {
+      G.step(DT);
+      if (G.state !== 'FLYING') break;
+      if (G.lockEvents.length > 0 && G.grid.every(row => row.every(c => c === null))) { swept = true; break; }
+    }
+    ok(swept && G.state === 'FLYING', 'zen top-out did not sweep');
+    press('Escape', 'Escape');
+    toMode('free');
+  });
+
+  T('daily determinism', () => {
+    toMode('daily');
+    G.start();
+    const a = { f: G.piece.shapeIndex, q: G.nextQueue.join(','), top: G.obstacles[0].baseTop };
+    G.start();
+    ok(G.piece.shapeIndex === a.f && G.nextQueue.join(',') === a.q &&
+       G.obstacles[0].baseTop === a.top, 'daily runs differ');
+    press('Escape', 'Escape');
+    toMode('free');
+  });
+
+  T('seed mode: deterministic, records untouched', () => {
+    game.customSeed = 999;
+    toMode('seed');
+    const bestBefore = G.best;
+    G.start();
+    ok(G.lastSeed === 999, 'seed not used');
+    const f1 = G.piece.shapeIndex;
+    G.start();
+    ok(G.piece.shapeIndex === f1, 'seed runs differ');
+    clearingLock(5);
+    press('Escape', 'Escape');
+    ok(G.best === bestBefore, 'seed run touched records');
+    toMode('free');
+  });
+
+  T('forceLock scores +5', () => {
+    G.start(); clearWell();
+    G.setPiece(1, 0, W.x + 2 * W.cell, W.b - 2 * W.cell, 0);
+    const s0 = G.score;
+    G.forceLock();
+    ok(G.score - s0 === 5, 'delta ' + (G.score - s0));
+  });
+
+  T('pause, countdown, Esc flow', () => {
+    G.start();
+    press('KeyP', 'p');
+    ok(G.state === 'PAUSED', 'not paused');
+    press('KeyP', 'p');
+    ok(G.state === 'RESUMING', 'not resuming');
+    for (let s = 0; s < 30; s++) G.step(DT);
+    ok(G.state === 'RESUMING', 'countdown burned without frames');
+    press('Escape', 'Escape');
+    ok(G.state === 'GAMEOVER', 'esc failed');
+  });
+
+  T('modifier shortcuts pass through', () => {
+    const cb = G.cbMode;
+    press('KeyC', 'c', { metaKey: true });
+    press('KeyC', 'c', { ctrlKey: true });
+    ok(G.cbMode === cb, 'modifier toggled letters');
+  });
+
+  T('history records runs, digits replay', () => {
+    toMode('free');
+    G.start();
+    clearingLock(5);
+    press('Escape', 'Escape');
+    ok(runHistory.length > 0 && runHistory[0].seed === G.lastSeed, 'history not recorded');
+    const seed = runHistory[0].seed;
+    press('Digit1', '1');
+    ok(G.state === 'FLYING' && G.mode === 'seed' && G.lastSeed === seed, 'digit replay failed');
+    press('Escape', 'Escape');
+    toMode('free');
+  });
+
+  T('stability: 1200 random steps, all locks supported', () => {
+    G.start();
+    for (let s = 0; s < 1200; s++) {
+      if (G.state === 'GAMEOVER') G.start();
+      if (s % 17 === 0) G.flap();
+      if (s % 53 === 0) G.rotate();
+      if (s % 71 === 0) G.holdSwap();
+      G.step(DT);
+    }
+    ok(G.lockEvents.every(ev => ev.supported === true), 'unsupported lock seen');
+  });
+
+  const results = [];
+  let passed = 0;
+  for (const t of tests) {
+    try {
+      t[1]();
+      results.push({ name: t[0], pass: true });
+      passed++;
+    } catch (err) {
+      results.push({ name: t[0], pass: false, err: String((err && err.message) || err) });
+    }
+  }
+
+  // put the world back: storage keys and constants as they were
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf('flapstack') === 0 && !(k in savedStorage)) localStorage.removeItem(k);
+    }
+    for (const k in savedStorage) localStorage.setItem(k, savedStorage[k]);
+  } catch (e) {}
+  for (const k in savedConfig) CONFIG[k] = savedConfig[k];
+
+  window.__testResults = { total: tests.length, passed: passed, failed: tests.length - passed, results: results };
+
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;top:10px;left:10px;z-index:11;' +
+    'background:rgba(20,25,34,0.96);color:#EDE8DC;font:12px ' + MONO + ';' +
+    'padding:12px 14px;border:1px solid #39424E;border-radius:6px;' +
+    'max-height:92vh;overflow:auto;width:400px;';
+  const head = document.createElement('div');
+  head.textContent = 'FLAPSTACK TEST SUITE  ' + passed + '/' + tests.length + ' passed';
+  head.style.cssText = 'font-weight:bold;margin-bottom:8px;color:' +
+    (passed === tests.length ? '#2D9C8A' : '#E0455A') + ';';
+  box.appendChild(head);
+  for (const r of results) {
+    const line = document.createElement('div');
+    line.textContent = (r.pass ? 'PASS  ' : 'FAIL  ') + r.name + (r.pass ? '' : '  [' + r.err + ']');
+    line.style.cssText = 'color:' + (r.pass ? '#2D9C8A' : '#E0455A') + ';margin-bottom:2px;';
+    box.appendChild(line);
+  }
+  const note = document.createElement('div');
+  note.textContent = 'reload without ?test=1 to play';
+  note.style.cssText = 'margin-top:8px;opacity:0.6;';
+  box.appendChild(note);
+  document.body.appendChild(box);
+}
+
+if (/[?&]test=1/.test(location.search)) {
+  setTimeout(runTestSuite, 60);
+}
 </script>
 </body>
 </html>
