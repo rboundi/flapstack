@@ -10,8 +10,8 @@ One file, zero dependencies, Canvas 2D. Open it and play.
 
 ## Play
 
+- **Play now:** https://rboundi.github.io/flapstack/
 - **Local:** open `index.html` in any desktop browser (double-click works, no server needed).
-- **Live:** https://rboundi.github.io/flapstack/ (GitHub Pages, once the repo is public).
 
 ## Controls
 
