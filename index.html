@@ -9,6 +9,10 @@
 <meta property="og:title" content="Flapstack">
 <meta property="og:description" content="Flap a four-block piece through the pipes, land it in the stack, clear rows.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%231E2430'/%3E%3Crect x='12' y='34' width='18' height='18' fill='%232D9C8A'/%3E%3Crect x='34' y='34' width='18' height='18' fill='%23E8B84C'/%3E%3Crect x='34' y='12' width='18' height='18' fill='%23E8604C'/%3E%3C/svg%3E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Flapstack">
+<link rel="manifest" href='data:application/manifest+json,{"name":"Flapstack","short_name":"Flapstack","start_url":".","display":"standalone","orientation":"landscape","background_color":"%231E2430","theme_color":"%231E2430","icons":[{"src":"data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 64 64%27%3E%3Crect width=%2764%27 height=%2764%27 rx=%2712%27 fill=%27%231E2430%27/%3E%3Crect x=%2712%27 y=%2734%27 width=%2718%27 height=%2718%27 fill=%27%232D9C8A%27/%3E%3Crect x=%2734%27 y=%2734%27 width=%2718%27 height=%2718%27 fill=%27%23E8B84C%27/%3E%3Crect x=%2734%27 y=%2712%27 width=%2718%27 height=%2718%27 fill=%27%23E8604C%27/%3E%3C/svg%3E","sizes":"any","type":"image/svg+xml","purpose":"any"}]}'>
 <style>
   html, body {
     margin: 0;
@@ -110,6 +114,8 @@ const CONFIG = {
   ATTACK_TIME: 120,       // time attack length in seconds
   LEVEL_LINES: 10,        // lines cleared per level
   TRAIL_MIN_SPEED: 150,   // scroll speed where the motion trail fades in
+  GHOST_RATE: 12,         // physics steps between ghost path samples (5 Hz)
+  ATTRACT_MS: 20000,      // idle time on the title before the demo starts
 
   SETTLE_DROP: 1100,      // px/s vertical glide of the wall landing
   SETTLE_SLIDE: 320,      // px/s horizontal align of the wall landing
@@ -135,7 +141,7 @@ const CONFIG = {
 const MONO = 'ui-monospace, Menlo, Consolas, monospace';
 
 // shown small on the title screen so bug reports can name a build
-const VERSION = 'v0.6.0';
+const VERSION = 'v0.7.0';
 
 // per-level backdrop wash, reusing the piece palette so no new hues appear
 const LEVEL_TINTS = ['#4C86E8', '#7B6CB2', '#2D9C8A', '#8AA84C', '#E8B84C', '#C24C8A', '#E8604C'];
@@ -225,7 +231,6 @@ const game = {
   playTime: 0,           // seconds of physics simulated this run
   level: 1,              // 1 + lines/LEVEL_LINES, drives the backdrop wash
   attackLeft: 0,         // seconds left in a time attack run
-  lastAttackSec: 0,      // for the final-seconds tick
   finish: '',            // victory label on the game over screen, '' for a death
   sprintBest: 0,         // fastest sprint finish in seconds, 0 when unset
   attackBest: 0,         // highest time attack score
@@ -266,6 +271,10 @@ const game = {
   trail: [],             // recent piece block positions for the motion trail
   toasts: [],            // sliding top banners: { text, at }
   uiButtons: [],         // clickable overlay rects, rebuilt every render
+  rec: [],               // ghost path samples this run: [ox, oy, rot, shape]
+  recTick: 0,            // step counter for the sampling cadence
+  ghostRun: null,        // { rec, score, t } replaying a prior attempt's path
+  idleAt: 0,             // last input time, for the title attract demo
   lockEvents: [],        // debug log of each lock: { cells, supported }
 };
 
@@ -294,12 +303,19 @@ function dailyDateStr(d) {
   return d.getFullYear() + '-' + mm + '-' + dd;
 }
 
-// storage helpers: all persistence goes through these two
+// storage helpers: all persistence goes through these
 function lsGet(key) {
   try { return localStorage.getItem(key); } catch (e) { return null; }
 }
 function lsSet(key, value) {
   try { localStorage.setItem(key, value); } catch (e) {}
+}
+// parse a stored JSON value, falling back on missing or corrupted data
+function lsJSON(key, fallback) {
+  try {
+    const v = JSON.parse(lsGet(key));
+    return v === null || v === undefined ? fallback : v;
+  } catch (e) { return fallback; }
 }
 
 function loadDailyBest() {
@@ -314,16 +330,32 @@ function recordFor(mode) {
     : mode === 'free' ? game.best : 0;
 }
 
+// label + display text for the mode's record: one source for the HUD, the
+// game over overlay, and the title screen's info line
+function recordText(mode) {
+  if (mode === 'daily') return { label: 'DAILY BEST', text: String(game.dailyBest) };
+  if (mode === 'sprint') {
+    return { label: 'BEST TIME', text: game.sprintBest > 0 ? fmtClock(game.sprintBest) : '--' };
+  }
+  if (mode === 'attack') return { label: 'ATTACK BEST', text: String(game.attackBest) };
+  return { label: 'BEST', text: String(game.best) };
+}
+
 function fmtClock(seconds) {
   const t = Math.floor(seconds);
   return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0');
 }
 
+// record loaders are shared by boot and the test suite's teardown, so the
+// in-memory mirrors can never drift from what a fresh boot would read
+function loadRecords() {
+  game.best = parseInt(lsGet('flapstack.best'), 10) || 0;
+  game.sprintBest = parseFloat(lsGet('flapstack.sprint')) || 0;
+  game.attackBest = parseInt(lsGet('flapstack.attack'), 10) || 0;
+  loadDailyBest();
+}
 game.rng = mulberry32((Math.random() * 0xFFFFFFFF) >>> 0);
-game.best = parseInt(lsGet('flapstack.best'), 10) || 0;
-game.sprintBest = parseFloat(lsGet('flapstack.sprint')) || 0;
-game.attackBest = parseInt(lsGet('flapstack.attack'), 10) || 0;
-loadDailyBest();
+loadRecords();
 
 // a #seed=12345 URL replays that exact run (seed mode). Re-applied on every
 // hash change so pasting a seed into the open tab also works between runs.
@@ -331,18 +363,23 @@ function applySeedHash() {
   const m = (location.hash || '').match(/seed=(\d+)/);
   if (!m) return;
   game.customSeed = parseInt(m[1], 10) >>> 0;
-  if (game.state === 'START' || game.state === 'GAMEOVER') game.mode = 'seed';
+  if (betweenRuns()) game.mode = 'seed';
 }
 applySeedHash();
 window.addEventListener('hashchange', applySeedHash);
 game.cbMode = lsGet('flapstack.cb') === '1';
+game.idleAt = performance.now();
+
+// G hides the ghost racer without deleting any recordings
+let ghostHidden = lsGet('flapstack.ghostoff') === '1';
 
 // lifetime totals across runs
 const life = { games: 0, lines: 0, bestTime: 0, allClears: 0 };
-try {
-  const raw = JSON.parse(lsGet('flapstack.life') || '{}');
-  for (const k in life) { if (typeof raw[k] === 'number') life[k] = raw[k]; }
-} catch (e) {}
+function loadLife() {
+  const raw = lsJSON('flapstack.life', {});
+  for (const k in life) { life[k] = typeof raw[k] === 'number' ? raw[k] : 0; }
+}
+loadLife();
 function saveLife() {
   lsSet('flapstack.life', JSON.stringify(life));
 }
@@ -350,17 +387,18 @@ function saveLife() {
 // daily streak: consecutive calendar days with at least one daily run
 let streakN = 0;
 function loadStreak() {
-  try {
-    const s = JSON.parse(lsGet('flapstack.streak') || '{"last":"","n":0}');
-    return { last: String(s.last || ''), n: s.n | 0 };
-  } catch (e) { return { last: '', n: 0 }; }
+  const s = lsJSON('flapstack.streak', {});
+  return { last: String(s.last || ''), n: s.n | 0 };
 }
 function bumpStreak() {
   const s = loadStreak();
   const today = dailyDateStr();
   if (s.last !== today) {
-    const yesterday = dailyDateStr(new Date(Date.now() - 86400000));
-    s.n = s.last === yesterday ? s.n + 1 : 1;
+    // walk back one calendar day (setDate handles DST-shortened days,
+    // where "now minus 24h" can land two dates back just after midnight)
+    const y = new Date();
+    y.setDate(y.getDate() - 1);
+    s.n = s.last === dailyDateStr(y) ? s.n + 1 : 1;
     s.last = today;
     lsSet('flapstack.streak', JSON.stringify(s));
   }
@@ -371,10 +409,11 @@ streakN = loadStreak().n;
 
 // last five finished runs, newest first, replayable by seed
 let runHistory = [];
-try {
-  runHistory = JSON.parse(lsGet('flapstack.history') || '[]');
+function loadHistory() {
+  runHistory = lsJSON('flapstack.history', []);
   if (!Array.isArray(runHistory)) runHistory = [];
-} catch (e) { runHistory = []; }
+}
+loadHistory();
 function pushHistory() {
   runHistory.unshift({
     score: game.score,
@@ -409,10 +448,8 @@ const BADGES = [
 ];
 let badges = {};
 function loadBadges() {
-  try {
-    const raw = JSON.parse(lsGet('flapstack.badges') || '{}');
-    badges = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-  } catch (e) { badges = {}; }
+  const raw = lsJSON('flapstack.badges', {});
+  badges = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
 }
 loadBadges();
 
@@ -424,6 +461,38 @@ function award(id) {
   lsSet('flapstack.badges', JSON.stringify(badges));
   addToast('BADGE  ' + b[1]);
   SFX.badge();
+}
+
+// Ghost race recordings: the best attempt per seed, up to four seeds, newest
+// first. Replaying a seed (daily included) races that attempt's piece path.
+// The blob can reach a few hundred KB, so it is parsed once and cached; every
+// recording carries its own sample rate so retuning GHOST_RATE later cannot
+// silently change the playback speed of old ghosts.
+let ghostCache = null;
+function ghosts() {
+  if (!ghostCache) {
+    ghostCache = lsJSON('flapstack.ghosts', []);
+    if (!Array.isArray(ghostCache)) ghostCache = [];
+  }
+  return ghostCache;
+}
+
+function ghostFor(seed) {
+  const g = ghosts().find(x => x && x.seed === seed);
+  return g && Array.isArray(g.rec) && g.rec.length > 1 ? g : null;
+}
+
+function saveGhost() {
+  if (game.rec.length < 10) return; // a run too short to race
+  const arr = ghosts();
+  const ix = arr.findIndex(g => g && g.seed === game.lastSeed);
+  if (ix >= 0) {
+    if (arr[ix].score >= game.score) return; // keep the stronger attempt
+    arr.splice(ix, 1);
+  }
+  arr.unshift({ seed: game.lastSeed, score: game.score, rate: CONFIG.GHOST_RATE, rec: game.rec });
+  if (arr.length > 4) arr.length = 4;
+  lsSet('flapstack.ghosts', JSON.stringify(arr));
 }
 
 // letter overlay for colorblind support: shape initial per block color
@@ -440,10 +509,12 @@ const REDUCED_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduc
 
 const audio = { ctx: null, muted: false, master: null, vol: 1 };
 audio.muted = lsGet('flapstack.muted') === '1';
-{
+function loadVolume() {
   const v = parseFloat(lsGet('flapstack.vol'));
   audio.vol = v >= 0 && v <= 1 ? v : 1;
+  if (audio.master) audio.master.gain.value = audio.vol;
 }
+loadVolume();
 
 function audioContext() {
   if (!audio.ctx) {
@@ -537,10 +608,16 @@ const SFX = {
     tone(0, 640, 0.10, 'sine', 0.12, 860);
     if (clean) tone(0.08, 960, 0.12, 'sine', 0.12, 1280);
   },
-  lock()   { tone(0, 170, 0.09, 'square', 0.13, 110); },
-  clear(n) {
+  // each shape lands on its own thud pitch, so runs develop a cadence
+  lock(shapeIndex) {
+    const f = 170 + (shapeIndex || 0) * 11;
+    tone(0, f, 0.09, 'square', 0.13, f * 0.65);
+  },
+  // the clear jingle climbs with the combo streak
+  clear(n, combo) {
     const notes = [523, 659, 784, 1047, 1319];
-    for (let i = 0; i <= Math.min(n, 3); i++) tone(i * 0.06, notes[i], 0.14, 'sine', 0.11);
+    const k = Math.min(1.35, 1 + 0.07 * Math.max(0, (combo || 1) - 1));
+    for (let i = 0; i <= Math.min(n, 3); i++) tone(i * 0.06, notes[i] * k, 0.14, 'sine', 0.11);
   },
   allClear() {
     const notes = [523, 659, 784, 1047, 1319];
@@ -554,7 +631,17 @@ const SFX = {
   dive()   { tone(0, 420, 0.08, 'triangle', 0.08, 210); },
   badge()  { tone(0, 880, 0.08, 'triangle', 0.10); tone(0.07, 1175, 0.16, 'triangle', 0.10); },
   level()  { tone(0, 523, 0.09, 'triangle', 0.10); tone(0.07, 659, 0.09, 'triangle', 0.10); tone(0.14, 880, 0.15, 'triangle', 0.12); },
-  finish() { const n = [523, 659, 784, 1047]; for (let i = 0; i < n.length; i++) tone(i * 0.09, n[i], 0.2, 'triangle', 0.12); },
+  // sprint gets a sprightly ascending run, attack a broader two-chord resolve
+  finishSprint() {
+    const n = [523, 659, 784, 988, 1319];
+    for (let i = 0; i < n.length; i++) tone(i * 0.07, n[i], 0.16, 'triangle', 0.12);
+  },
+  finishAttack() {
+    tone(0, 392, 0.3, 'triangle', 0.12);
+    tone(0.12, 494, 0.3, 'triangle', 0.12);
+    tone(0.24, 587, 0.45, 'triangle', 0.13);
+    tone(0.24, 294, 0.45, 'sine', 0.08);
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -644,12 +731,22 @@ function spawnPiece() {
   newObstacles();
 }
 
-function startRun() {
-  const seed = game.mode === 'daily' ? hashStr('flapstack-' + dailyDateStr())
+// forceSeed overrides the mode's usual seed choice for exact replays (zen
+// history entries use it; seed mode replays flow through customSeed instead)
+function startRun(forceSeed) {
+  const seed = typeof forceSeed === 'number' ? forceSeed >>> 0
+    : game.mode === 'daily' ? hashStr('flapstack-' + dailyDateStr())
     : game.mode === 'seed' ? game.customSeed
     : (Math.random() * 0xFFFFFFFF) >>> 0;
   game.rng = mulberry32(seed);
   game.lastSeed = seed;
+  // race the best stored attempt on this seed, if there is one
+  const ghost = ghostFor(seed);
+  game.ghostRun = ghost
+    ? { rec: ghost.rec, score: ghost.score, rate: ghost.rate || CONFIG.GHOST_RATE, t: 0 }
+    : null;
+  game.rec = [];
+  game.recTick = 0;
   game.grid = makeEmptyGrid();
   game.score = 0;
   game.lines = 0;
@@ -663,8 +760,12 @@ function startRun() {
   game.level = 1;
   game.finish = '';
   game.attackLeft = game.mode === 'attack' ? CONFIG.ATTACK_TIME : 0;
-  game.lastAttackSec = 0;
   game.scrollSpeed = CONFIG.SCROLL_START;
+  // zen is a practice room: it keeps its own scroll speed ([ and ] adjust it)
+  if (game.mode === 'zen') {
+    const zs = parseInt(lsGet('flapstack.zenspeed'), 10);
+    if (zs >= 60 && zs <= 260) game.scrollSpeed = zs;
+  }
   game.obstacleGap = CONFIG.GAP;
   game.bag = [];
   game.hold = null;
@@ -694,6 +795,8 @@ function copyResult() {
   let text = 'Flapstack  score ' + game.score + '  lines ' + game.lines +
     '  combo x' + game.stats.bestCombo.toFixed(1) + '  time ' + fmtClock(game.playTime);
   if (game.mode === 'daily') text += '  daily ' + dailyDateStr();
+  // a #seed= link opens piped seed mode, which would not reproduce a zen run
+  else if (game.mode === 'zen') text += '  zen practice';
   else text += '  replay: ' + location.origin + location.pathname + '#seed=' + game.lastSeed;
   const fx = CONFIG.LOGICAL_W / 2;
   if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -706,15 +809,100 @@ function copyResult() {
   }
 }
 
+// A shareable result card: 640x360 canvas with the run summary and a mini
+// snapshot of the final well. X or the game over button copies it to the
+// clipboard as an image, falling back to a PNG download.
+function buildResultCard() {
+  const c = document.createElement('canvas');
+  c.width = 640;
+  c.height = 360;
+  const x = c.getContext('2d');
+  x.fillStyle = CONFIG.BG;
+  x.fillRect(0, 0, 640, 360);
+  // palette strip along the top
+  for (let i = 0; i < SHAPES.length; i++) {
+    x.fillStyle = SHAPES[i].color;
+    x.fillRect(i * (640 / SHAPES.length), 0, 640 / SHAPES.length, 6);
+  }
+  x.fillStyle = CONFIG.INK;
+  x.textBaseline = 'middle';
+  x.textAlign = 'left';
+  x.font = 'bold 30px ' + MONO;
+  x.fillText('FLAPSTACK', 30, 52);
+  x.font = 'bold 15px ' + MONO;
+  const modeLabel = game.mode === 'daily' ? 'DAILY ' + dailyDateStr() : game.mode.toUpperCase();
+  x.fillText(modeLabel + (game.finish ? '   ' + game.finish : ''), 30, 88);
+  x.font = 'bold 64px ' + MONO;
+  x.fillText(String(game.score), 30, 160);
+  x.font = '17px ' + MONO;
+  x.fillText('lines ' + game.lines + '    combo x' + game.stats.bestCombo.toFixed(1) +
+             '    time ' + fmtClock(game.playTime), 30, 216);
+  x.globalAlpha = 0.75;
+  x.font = '14px ' + MONO;
+  x.fillText('seed ' + game.lastSeed, 30, 300);
+  x.fillText('#seed=' + game.lastSeed + ' to replay', 30, 322);
+  x.globalAlpha = 1;
+  // mini snapshot of the final well
+  const ms = 11, mx = 640 - 30 - WELL_COLS * ms, my = 100;
+  x.strokeStyle = CONFIG.INK;
+  x.lineWidth = 2;
+  x.strokeRect(mx - 3, my - 3, WELL_COLS * ms + 6, WELL_ROWS * ms + 6);
+  for (let r = 0; r < WELL_ROWS; r++) {
+    for (let cc = 0; cc < WELL_COLS; cc++) {
+      const color = game.grid[r][cc];
+      if (color) {
+        x.fillStyle = color;
+        x.fillRect(mx + cc * ms, my + r * ms, ms - 1, ms - 1);
+      }
+    }
+  }
+  return c;
+}
+
+function copyCard() {
+  if (game.state !== 'GAMEOVER') return;
+  const card = buildResultCard();
+  const fx = CONFIG.LOGICAL_W / 2;
+  const fallback = () => {
+    try {
+      const a = document.createElement('a');
+      a.href = card.toDataURL('image/png');
+      a.download = 'flapstack-' + game.score + '.png';
+      a.click();
+      addFloater(fx, 150, 'CARD SAVED');
+    } catch (e) { addFloater(fx, 150, 'CARD FAILED'); }
+  };
+  try {
+    if (navigator.clipboard && navigator.clipboard.write && window.ClipboardItem) {
+      card.toBlob((blob) => {
+        if (!blob) { fallback(); return; }
+        navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]).then(
+          () => addFloater(fx, 150, 'CARD COPIED!'),
+          fallback
+        );
+      });
+    } else {
+      fallback();
+    }
+  } catch (e) { fallback(); }
+}
+
 // replay a recent run by its seed (title digits 1-5 and the clickable rows).
 // Zen runs replay in zen; everything else replays as a plain seed run.
 function replayHistory(i) {
-  if (game.state !== 'START' && game.state !== 'GAMEOVER') return;
+  if (!betweenRuns()) return;
   const h = runHistory[i];
   if (!h) return;
-  game.customSeed = h.seed >>> 0;
-  game.mode = h.mode === 'zen' ? 'zen' : 'seed';
-  startRun();
+  if (h.mode === 'zen') {
+    // zen ignores customSeed (that path is for piped seed mode), so the
+    // recorded seed is forced directly for an exact piece-sequence replay
+    game.mode = 'zen';
+    startRun(h.seed);
+  } else {
+    game.customSeed = h.seed >>> 0;
+    game.mode = 'seed';
+    startRun();
+  }
 }
 
 // Daily mode reruns the same seeded sequence for everyone on the same date;
@@ -729,8 +917,13 @@ function modeList() {
   return m;
 }
 
+// mode switching, replays, and the badge gallery only exist between runs
+function betweenRuns() {
+  return game.state === 'START' || game.state === 'GAMEOVER';
+}
+
 function setMode(m) {
-  if (game.state !== 'START' && game.state !== 'GAMEOVER') return;
+  if (!betweenRuns()) return;
   game.mode = m;
   if (m === 'daily') loadDailyBest();
 }
@@ -742,14 +935,16 @@ function toggleMode() {
 
 // finish, when given, is a victory label (sprint target reached, attack timer
 // out): the crash beat and death sting are skipped and the overlay says so.
-function gameOver(finish) {
+// quiet skips the sting entirely, for deliberate exits from the pause menu.
+function gameOver(finish, quiet) {
   if (game.state === 'GAMEOVER') return;
   game.state = 'GAMEOVER';
   game.finish = finish || '';
   game.gameOverAt = performance.now();
   if (finish) {
-    SFX.finish();
-  } else {
+    if (game.mode === 'sprint') SFX.finishSprint();
+    else SFX.finishAttack();
+  } else if (!quiet) {
     SFX.gameOver();
     shake(9);
   }
@@ -784,11 +979,12 @@ function gameOver(finish) {
   saveLife();
   if (game.mode === 'daily') bumpStreak();
   pushHistory();
+  saveGhost();
   award('first-flight');
   if (game.score >= 1000) award('grand');
   if (game.playTime >= 300) award('five-min');
   // any finished run retires the first-run hints for good
-  if (game.tut) { lsSet('flapstack.tut', '1'); game.tut = null; }
+  tutRetire();
 }
 
 // Losing a life forfeits the current piece and launches a fresh flight; the
@@ -816,10 +1012,7 @@ function flap() {
     game.piece.vy = CONFIG.FLAP_VY;
     game.flapAt = performance.now();
     SFX.flap();
-    if (game.tut && game.tut.step === 0 && ++game.tut.flaps >= 3) {
-      game.tut.step = 1;
-      game.tut.at = performance.now();
-    }
+    if (game.tut && game.tut.step === 0 && ++game.tut.flaps >= 3) tutAdvance(1);
   }
 }
 
@@ -831,6 +1024,98 @@ function dive() {
   game.piece.vy = Math.max(game.piece.vy, CONFIG.DIVE_VY);
   game.diveAt = performance.now();
   SFX.dive();
+}
+
+// First-run hint transitions, shared by input, physics, scoring, and render
+// code so the step/retire rules live in one place.
+function tutAdvance(step) {
+  if (!game.tut || game.tut.step >= step) return;
+  game.tut.step = step;
+  game.tut.at = performance.now();
+}
+
+function tutRetire() {
+  if (!game.tut) return;
+  lsSet('flapstack.tut', '1');
+  game.tut = null;
+}
+
+// P and the gamepad Start button share this; resuming runs the countdown
+function togglePause() {
+  if (game.state === 'FLYING') {
+    game.state = 'PAUSED';
+  } else if (game.state === 'PAUSED') {
+    game.state = 'RESUMING';
+    game.resumeLeft = CONFIG.RESUME_MS;
+    game.lastCount = 0;
+  } else if (game.state === 'RESUMING') {
+    game.state = 'PAUSED';
+  }
+}
+
+// Deliberate exits from the pause menu. The abandoned run is banked first
+// (records, history, lifetime stats) but without the crash sting.
+function pauseRestart() {
+  if (game.state !== 'PAUSED') return;
+  gameOver('', true);
+  startRun();
+}
+
+function pauseToTitle() {
+  if (game.state !== 'PAUSED') return;
+  gameOver('', true);
+  game.state = 'START';
+}
+
+// Gamepad: standard mapping, polled once per frame. Actions fire on the
+// pressed edge only, so a held button never repeats. Polling only starts
+// after the browser reports a pad, so padless players pay nothing per frame.
+const pad = { prev: {}, seen: false };
+window.addEventListener('gamepadconnected', () => { pad.seen = true; });
+window.addEventListener('gamepaddisconnected', () => { pad.prev = {}; });
+
+function padStep(pressed) {
+  const edge = (b) => pressed[b] && !pad.prev[b];
+  // an open help/badge panel swallows the pad like it swallows the keyboard;
+  // any fresh press just closes it
+  if (game.helpOpen || game.badgesOpen) {
+    for (const k in pressed) {
+      if (edge(k)) {
+        game.helpOpen = false;
+        game.badgesOpen = false;
+        break;
+      }
+    }
+    pad.prev = pressed;
+    return;
+  }
+  if (edge(0)) primaryAction();                    // A: flap / start / restart
+  if (edge(1) || edge(2) || edge(12)) tryRotate(); // B, X, dpad up
+  if (edge(3)) tryHold();                          // Y
+  if (edge(13)) dive();                            // dpad down / stick down
+  if (edge(9)) togglePause();                      // Start
+  pad.prev = pressed;
+}
+
+function pollGamepad() {
+  if (!pad.seen || !navigator.getGamepads) return;
+  let gp = null;
+  try {
+    const list = navigator.getGamepads();
+    for (const g of list) { if (g && g.connected) { gp = g; break; } }
+  } catch (e) { return; }
+  if (!gp) return;
+  const pressed = {};
+  let any = false;
+  for (let i = 0; i < gp.buttons.length; i++) {
+    if (gp.buttons[i] && gp.buttons[i].pressed) { pressed[i] = true; any = true; }
+  }
+  if (gp.axes && gp.axes.length > 1) {
+    if (gp.axes[1] > 0.6) { pressed[13] = true; any = true; }
+    if (gp.axes[1] < -0.6) { pressed[12] = true; any = true; }
+  }
+  if (any) game.idleAt = performance.now();
+  padStep(pressed);
 }
 
 // ---------------------------------------------------------------------------
@@ -973,22 +1258,24 @@ function topOccupiedRow() {
   return WELL_ROWS;
 }
 
-function canPlace(shapeIndex, rotIndex, col0, row0) {
+// grid defaults to the live well; the attract demo passes its own
+function canPlace(shapeIndex, rotIndex, col0, row0, grid) {
+  const g = grid || game.grid;
   const rot = SHAPES[shapeIndex].rotations[rotIndex];
   for (const o of rot.cells) {
     const c = col0 + o.dx, r = row0 + o.dy;
     if (c < 0 || c >= WELL_COLS || r < 0 || r >= WELL_ROWS) return false;
-    if (game.grid[r][c]) return false;
+    if (g[r][c]) return false;
   }
   return true;
 }
 
 // Lowest row the piece can rest at when dropping straight down from
 // (col0, row0). Returns null when the starting placement itself is invalid.
-function restingRow(shapeIndex, rotIndex, col0, row0) {
-  if (!canPlace(shapeIndex, rotIndex, col0, row0)) return null;
+function restingRow(shapeIndex, rotIndex, col0, row0, grid) {
+  if (!canPlace(shapeIndex, rotIndex, col0, row0, grid)) return null;
   let r = row0;
-  while (canPlace(shapeIndex, rotIndex, col0, r + 1)) r++;
+  while (canPlace(shapeIndex, rotIndex, col0, r + 1, grid)) r++;
   return r;
 }
 
@@ -1102,10 +1389,7 @@ function lockPiece(viaSettle) {
   game.lockEvents.push({ cells: cells.map(c => ({ c: c.c, r: c.r })), supported });
   game.score += CONFIG.LOCK_SCORE;
   game.stats.pieces += 1;
-  if (game.tut && game.tut.step <= 1) {
-    game.tut.step = 2;
-    game.tut.at = performance.now();
-  }
+  tutAdvance(2);
   if (!viaSettle) {
     game.score += CONFIG.PRECISION_BONUS;
     const px = WELL_X + (cells.reduce((a, c) => a + c.c, 0) / cells.length + 0.5) * CELL;
@@ -1144,7 +1428,7 @@ function lockPiece(viaSettle) {
     game.flashRows = fullRows.slice();
     game.flashAt = performance.now();
     shake(2 + n * 1.5);
-    SFX.clear(n);
+    SFX.clear(n, game.combo);
     const fx = WELL_X + WELL_W / 2;
     const fy = WELL_Y + fullRows[0] * CELL + CELL / 2;
     addFloater(fx, fy, mult > 1 ? '+' + points + ' x' + mult.toFixed(1) : '+' + points);
@@ -1175,7 +1459,7 @@ function lockPiece(viaSettle) {
     }
   } else {
     game.combo = 0;
-    SFX.lock();
+    SFX.lock(p.shapeIndex);
   }
   if (game.score >= 1000) award('grand');
 
@@ -1209,9 +1493,10 @@ function lockPiece(viaSettle) {
     }
   }
 
-  // danger warning when the stack reaches the top rows
+  // danger warning when the stack reaches the top rows, recomputed fresh
+  // because a zen sweep just above may have emptied the well
   const wasDanger = game.danger;
-  game.danger = stackTop < CONFIG.DANGER_ROWS;
+  game.danger = topOccupiedRow() < CONFIG.DANGER_ROWS;
   if (game.danger && !wasDanger) SFX.warn();
 
   // difficulty ramp (zen stays at a fixed, gentle pace), then next flight
@@ -1231,12 +1516,10 @@ function step(dt) {
   if (game.playTime >= 300) award('five-min');
   // time attack: the clock only burns while physics runs, so pausing pauses it
   if (game.mode === 'attack') {
+    const secBefore = Math.ceil(game.attackLeft);
     game.attackLeft -= dt;
     const sec = Math.ceil(game.attackLeft);
-    if (sec !== game.lastAttackSec) {
-      game.lastAttackSec = sec;
-      if (sec <= 10 && sec > 0) SFX.rotate();
-    }
+    if (sec !== secBefore && sec <= 10 && sec > 0) SFX.rotate();
     if (game.attackLeft <= 0) {
       game.attackLeft = 0;
       gameOver('TIME UP!');
@@ -1247,10 +1530,7 @@ function step(dt) {
   const p = game.piece;
   const prev = blocksOf(p);
   // first-run hint 1 also retires once the piece is nearing the obstacle
-  if (game.tut && game.tut.step === 0 && p.ox > 240) {
-    game.tut.step = 1;
-    game.tut.at = performance.now();
-  }
+  if (game.tut && game.tut.step === 0 && p.ox > 240) tutAdvance(1);
 
   // obstacle drift: at high difficulty the gaps slide up and down together
   for (const o of game.obstacles) {
@@ -1290,9 +1570,20 @@ function step(dt) {
     cur = blocksOf(p);
   }
 
-  // motion trail sample (render decides whether the speed warrants drawing)
-  game.trail.push(cur.map(b => ({ x: b.x, y: b.y })));
-  if (game.trail.length > 10) game.trail.shift();
+  // motion trail samples, kept only under the conditions the trail can draw
+  // (otherwise early-game and zen sessions allocate 300 dead objects a second)
+  if (!REDUCED_MOTION && game.scrollSpeed >= CONFIG.TRAIL_MIN_SPEED) {
+    game.trail.push(cur.map(b => ({ x: b.x, y: b.y })));
+    if (game.trail.length > 10) game.trail.shift();
+  }
+
+  // ghost race: sample this run's path at a low rate, and advance the
+  // replayed attempt on the same clock physics runs on
+  game.recTick = (game.recTick + 1) % CONFIG.GHOST_RATE;
+  if (game.recTick === 0 && game.rec.length < 3600) {
+    game.rec.push([Math.round(p.ox * 10) / 10, Math.round(p.oy * 10) / 10, p.rot, p.shapeIndex]);
+  }
+  if (game.ghostRun) game.ghostRun.t += dt;
 
   // 1. obstacle collision
   if (hitsObstacle(cur)) { loseLife(); return; }
@@ -1541,6 +1832,31 @@ function drawGhost() {
   ctx.restore();
 }
 
+// The ghost racer: the recorded piece path of a prior attempt on this seed,
+// interpolated between its low-rate samples and drawn translucent.
+function drawGhostRun() {
+  const gr = game.ghostRun;
+  if (!gr || ghostHidden) return;
+  // sample k was captured at the END of its sampling window, so playback
+  // shifts one period back (else the ghost runs a full period ahead of the
+  // attempt it replays); before the first sample it holds sample 0
+  const period = (gr.rate || CONFIG.GHOST_RATE) / 60;
+  const f = Math.max(0, gr.t / period - 1);
+  const i = Math.floor(f);
+  if (i >= gr.rec.length) return; // the recorded run has ended
+  const a = gr.rec[i];
+  const b = gr.rec[Math.min(i + 1, gr.rec.length - 1)];
+  const frac = f - i;
+  const ox = a[0] + (b[0] - a[0]) * frac;
+  const oy = a[1] + (b[1] - a[1]) * frac;
+  const def = SHAPES[a[3]].rotations[a[2]];
+  ctx.save();
+  ctx.globalAlpha = 0.20;
+  ctx.fillStyle = SHAPES[a[3]].color;
+  for (const o of def.cells) ctx.fillRect(ox + o.dx * CELL, oy + o.dy * CELL, CELL, CELL);
+  ctx.restore();
+}
+
 function drawClearFlash() {
   if (game.flashRows.length === 0) return;
   const t = (performance.now() - game.flashAt) / CONFIG.FLASH_MS;
@@ -1711,12 +2027,8 @@ function drawHUD() {
   ctx.fillText('SCORE ' + game.score, 24, 22);
   ctx.fillText('LINES ' + game.lines + '  LV ' + game.level, 24, 50);
   ctx.font = 'bold 16px ' + MONO;
-  const bestShown = game.mode === 'daily' ? game.dailyBest
-    : game.mode === 'sprint' ? (game.sprintBest > 0 ? fmtClock(game.sprintBest) : '--')
-    : game.mode === 'attack' ? game.attackBest
-    : game.best;
   if (game.bestBeaten) ctx.fillStyle = CONFIG.HEART;
-  ctx.fillText('BEST ' + bestShown, 24, 82);
+  ctx.fillText('BEST ' + recordText(game.mode).text, 24, 82);
   ctx.fillStyle = CONFIG.INK;
   let tagY = 104;
   ctx.font = 'bold 12px ' + MONO;
@@ -1726,6 +2038,10 @@ function drawHUD() {
   else if (game.mode === 'sprint') {
     ctx.fillText('SPRINT ' + Math.min(game.lines, CONFIG.SPRINT_LINES) + '/' + CONFIG.SPRINT_LINES +
                  '   ' + fmtClock(game.playTime), 24, tagY);
+    tagY += 16;
+  }
+  if (game.ghostRun && !ghostHidden) {
+    ctx.fillText('GHOST ' + game.ghostRun.score, 24, tagY);
     tagY += 16;
   }
 
@@ -1853,6 +2169,96 @@ function drawTitleDrift() {
   ctx.restore();
 }
 
+// ---------------------------------------------------------------------------
+// Attract demo: after ATTRACT_MS idle on the title, a self-playing zen-style
+// flight runs behind the overlay. Its own tiny world (piece, grid, no pipes),
+// so it can never touch real state or records. Any input dismisses it.
+// ---------------------------------------------------------------------------
+
+const attract = { on: false, grid: null, piece: null, lastT: 0 };
+
+function attractReset() {
+  attract.grid = makeEmptyGrid();
+  attract.piece = null;
+}
+
+function attractSpawn() {
+  const idx = Math.floor(Math.random() * SHAPES.length);
+  const rot = Math.floor(Math.random() * 4);
+  const def = SHAPES[idx].rotations[rot];
+  // aim for the column with the deepest real resting row, using the same
+  // cell-accurate placement rules as gameplay so demo stacks are legal
+  let bestCol = -1, bestRow = -1;
+  for (let c0 = 0; c0 <= WELL_COLS - def.w; c0++) {
+    const r = restingRow(idx, rot, c0, 0, attract.grid);
+    if (r !== null && r > bestRow) { bestRow = r; bestCol = c0; }
+  }
+  // a demo well too tall to land in sweeps clean and tries again
+  if (bestCol < 0 || bestRow < 3) {
+    attractReset();
+    attractSpawn();
+    return;
+  }
+  attract.piece = {
+    shapeIndex: idx, rot: rot, targetCol: bestCol, targetRow: bestRow,
+    x: -80, y: 120 + Math.random() * 280, vy: 0, glide: false,
+  };
+}
+
+function attractStep(dt) {
+  if (!attract.grid) attractReset();
+  if (!attract.piece) attractSpawn();
+  const p = attract.piece;
+  const def = SHAPES[p.shapeIndex].rotations[p.rot];
+  const tx = WELL_X + p.targetCol * CELL;
+  const ty = WELL_Y + p.targetRow * CELL;
+  if (p.glide) {
+    // the real landing feel constants, so a retune reaches the demo too
+    const mx = CONFIG.SETTLE_SLIDE * dt, my = CONFIG.SETTLE_DROP * dt;
+    const dx = tx - p.x, dy = ty - p.y;
+    p.x = Math.abs(dx) <= mx ? tx : p.x + Math.sign(dx) * mx;
+    p.y = Math.abs(dy) <= my ? ty : p.y + Math.sign(dy) * my;
+    if (p.x === tx && p.y === ty) {
+      for (const o of def.cells) {
+        attract.grid[p.targetRow + o.dy][p.targetCol + o.dx] = SHAPES[p.shapeIndex].color;
+      }
+      attract.piece = null;
+    }
+    return;
+  }
+  // flight: the game's starting scroll and physics, bang-bang auto flaps
+  // toward the landing height. No pipes, so the demo can never crash.
+  p.x += CONFIG.SCROLL_START * dt;
+  p.vy = Math.min(p.vy + CONFIG.GRAVITY * dt, CONFIG.TERMINAL_VY);
+  p.y += p.vy * dt;
+  if (p.vy > 0 && p.y > Math.min(ty - 70, CONFIG.LOGICAL_H - 130)) {
+    p.vy = CONFIG.FLAP_VY * 0.85;
+  }
+  if (p.y < 30) { p.y = 30; p.vy = Math.max(p.vy, 0); }
+  if (p.x >= WELL_X - CELL) p.glide = true;
+}
+
+function drawAttract() {
+  ctx.save();
+  ctx.globalAlpha = 0.5;
+  for (let r = 0; r < WELL_ROWS; r++) {
+    for (let c = 0; c < WELL_COLS; c++) {
+      const color = attract.grid[r][c];
+      if (color) {
+        ctx.fillStyle = color;
+        ctx.fillRect(WELL_X + c * CELL, WELL_Y + r * CELL, CELL, CELL);
+      }
+    }
+  }
+  const p = attract.piece;
+  if (p) {
+    const def = SHAPES[p.shapeIndex].rotations[p.rot];
+    ctx.fillStyle = SHAPES[p.shapeIndex].color;
+    for (const o of def.cells) ctx.fillRect(p.x + o.dx * CELL, p.y + o.dy * CELL, CELL, CELL);
+  }
+  ctx.restore();
+}
+
 // faint parallax backdrop in the flight zone: distant dots and haze bands
 // scrolling slower than the action. Pure ambience, static under reduced motion.
 const backdrop = { stars: [], clouds: [], scroll: 0, lastT: 0 };
@@ -1865,10 +2271,12 @@ function drawBackdrop() {
       });
     }
     for (let i = 0; i < 6; i++) {
+      const w = 90 + Math.random() * 130;
       backdrop.clouds.push({
         x: Math.random() * WELL_X, y: 30 + Math.random() * (CONFIG.LOGICAL_H - 90),
-        w: 90 + Math.random() * 130, h: 14 + Math.random() * 18,
+        w: w, h: 14 + Math.random() * 18,
         f: 0.4 + Math.random() * 0.25,
+        range: WELL_X + w, // wrap span, fixed at spawn
       });
     }
   }
@@ -1885,8 +2293,7 @@ function drawBackdrop() {
   }
   ctx.globalAlpha = 0.045;
   for (const cl of backdrop.clouds) {
-    const range = WELL_X + cl.w;
-    const x = ((cl.x - backdrop.scroll * cl.f) % range + range) % range - cl.w;
+    const x = ((cl.x - backdrop.scroll * cl.f) % cl.range + cl.range) % cl.range - cl.w;
     ctx.fillRect(x, cl.y, cl.w, cl.h);
   }
   ctx.restore();
@@ -1913,8 +2320,7 @@ function drawTutorial() {
   if (!game.tut) return;
   const now = performance.now();
   if (game.tut.step === 2 && now - game.tut.at > 4000) {
-    lsSet('flapstack.tut', '1');
-    game.tut = null;
+    tutRetire();
     return;
   }
   ctx.save();
@@ -1989,6 +2395,15 @@ function uiButton(x, y, w, h, label, action, opts) {
   ctx.restore();
 }
 
+// lay out a centered row of buttons; defs are [label, action, extraOpts?]
+function uiButtonRow(y, defs, w, h, gap, opts) {
+  let x = (CONFIG.LOGICAL_W - (defs.length * w + (defs.length - 1) * gap)) / 2;
+  for (const d of defs) {
+    uiButton(x, y, w, h, d[0], d[1], d[2] ? Object.assign({}, opts, d[2]) : opts);
+    x += w + gap;
+  }
+}
+
 function drawStartOverlay() {
   drawOverlayPanel();
   ctx.fillStyle = CONFIG.INK;
@@ -2001,43 +2416,32 @@ function drawStartOverlay() {
                CONFIG.LOGICAL_W / 2, 208);
 
   // mode select: clickable, and D cycles through the same list
-  const list = modeList();
-  const MW = 104, MH = 34, MG = 10;
-  let mx = (CONFIG.LOGICAL_W - (list.length * MW + (list.length - 1) * MG)) / 2;
-  for (const m of list) {
-    uiButton(mx, 244, MW, MH, m.toUpperCase(), setMode.bind(null, m), { active: game.mode === m });
-    mx += MW + MG;
-  }
+  uiButtonRow(244, modeList().map(m =>
+    [m.toUpperCase(), setMode.bind(null, m), { active: game.mode === m }]), 104, 34, 10);
   ctx.fillStyle = CONFIG.INK;
   ctx.font = '15px ' + MONO;
+  const best = recordText(game.mode).text;
   const info = game.mode === 'daily'
-      ? 'Same run for everyone on ' + dailyDateStr() + '.   Best ' + game.dailyBest +
+      ? 'Same run for everyone on ' + dailyDateStr() + '.   Best ' + best +
         (streakN > 0 ? '   Streak ' + streakN : '')
     : game.mode === 'seed' ? 'Replaying seed ' + game.customSeed
     : game.mode === 'zen' ? 'No pipes, no game over. Pure stacking practice.'
-    : game.mode === 'sprint' ? 'Race to ' + CONFIG.SPRINT_LINES + ' lines.   Best ' +
-        (game.sprintBest > 0 ? fmtClock(game.sprintBest) : '--')
-    : game.mode === 'attack' ? 'Best score in ' + fmtClock(CONFIG.ATTACK_TIME) + '.   Best ' + game.attackBest
-    : 'Endless flight, ramping difficulty.   Best ' + game.best;
+    : game.mode === 'sprint' ? 'Race to ' + CONFIG.SPRINT_LINES + ' lines.   Best ' + best
+    : game.mode === 'attack' ? 'Best score in ' + fmtClock(CONFIG.ATTACK_TIME) + '.   Best ' + best
+    : 'Endless flight, ramping difficulty.   Best ' + best;
   ctx.fillText(info, CONFIG.LOGICAL_W / 2, 302);
 
   ctx.font = 'bold 21px ' + MONO;
   ctx.fillText('Press Space to start', CONFIG.LOGICAL_W / 2, 344);
 
-  const btns = [
+  uiButtonRow(380, [
     ['SOUND ' + (audio.muted ? 'OFF' : 'ON'), toggleMute],
     ['MUSIC ' + (music.on ? 'ON' : 'OFF'), toggleMusic],
     ['VOL ' + Math.round(audio.vol * 100) + '%', () => setVolume(audio.vol >= 1 ? 0.2 : audio.vol + 0.2)],
     ['BADGES ' + Object.keys(badges).length + '/' + BADGES.length,
       () => { game.badgesOpen = !game.badgesOpen; }],
     ['HELP ?', () => { game.helpOpen = !game.helpOpen; }],
-  ];
-  const BW = 118, BH = 26;
-  let bx = (CONFIG.LOGICAL_W - (btns.length * BW + (btns.length - 1) * 8)) / 2;
-  for (const b of btns) {
-    uiButton(bx, 380, BW, BH, b[0], b[1], { font: 'bold 12px ' });
-    bx += BW + 8;
-  }
+  ], 118, 26, 8, { font: 'bold 12px ' });
 
   ctx.fillStyle = CONFIG.INK;
   if (life.games > 0) {
@@ -2085,20 +2489,13 @@ function drawGameOverOverlay() {
     ctx.fillText('Score ' + game.score + '     Lines ' + game.lines, CONFIG.LOGICAL_W / 2, 236);
   }
   ctx.font = 'bold 20px ' + MONO;
-  const bestLabel = game.mode === 'daily' ? 'DAILY BEST '
-    : game.mode === 'sprint' ? 'BEST TIME '
-    : game.mode === 'attack' ? 'ATTACK BEST '
-    : 'BEST ';
-  const bestShown = game.mode === 'daily' ? game.dailyBest
-    : game.mode === 'sprint' ? (game.sprintBest > 0 ? fmtClock(game.sprintBest) : '--')
-    : game.mode === 'attack' ? game.attackBest
-    : game.best;
+  const rt = recordText(game.mode);
   if (game.newBest) {
     ctx.fillStyle = CONFIG.HEART;
-    ctx.fillText('NEW ' + bestLabel + bestShown + '!', CONFIG.LOGICAL_W / 2, 280);
+    ctx.fillText('NEW ' + rt.label + ' ' + rt.text + '!', CONFIG.LOGICAL_W / 2, 280);
     ctx.fillStyle = CONFIG.INK;
   } else {
-    ctx.fillText(bestLabel + bestShown, CONFIG.LOGICAL_W / 2, 280);
+    ctx.fillText(rt.label + ' ' + rt.text, CONFIG.LOGICAL_W / 2, 280);
   }
   ctx.font = '17px ' + MONO;
   ctx.fillText('Pieces ' + game.stats.pieces + '     Passes ' + game.stats.passes +
@@ -2106,25 +2503,24 @@ function drawGameOverOverlay() {
                CONFIG.LOGICAL_W / 2, 322);
   ctx.font = 'bold 22px ' + MONO;
   ctx.fillText('Press Space to restart', CONFIG.LOGICAL_W / 2, 368);
-  const btns = [
+  // actions re-check the state: a click can land on rects from a frame
+  // rendered just before the keyboard already changed the state
+  uiButtonRow(402, [
     ['RETRY', () => {
-      if (performance.now() - game.gameOverAt >= CONFIG.GAMEOVER_LOCKOUT) startRun();
+      if (game.state === 'GAMEOVER' &&
+          performance.now() - game.gameOverAt >= goLockoutMs()) startRun();
     }],
-    ['TITLE', () => { game.state = 'START'; }],
+    ['TITLE', () => { if (game.state === 'GAMEOVER') game.state = 'START'; }],
     ['COPY RESULT', copyResult],
+    ['COPY CARD', copyCard],
     ['HELP ?', () => { game.helpOpen = !game.helpOpen; }],
-  ];
-  const BW = 124, BH = 28;
-  let bx = (CONFIG.LOGICAL_W - (btns.length * BW + (btns.length - 1) * 10)) / 2;
-  for (const b of btns) {
-    uiButton(bx, 402, BW, BH, b[0], b[1], { font: 'bold 12px ' });
-    bx += BW + 10;
-  }
+  ], 124, 28, 10, { font: 'bold 12px ' });
   ctx.fillStyle = CONFIG.INK;
-  if (game.mode !== 'daily') {
-    ctx.font = '14px ' + MONO;
+  ctx.font = '14px ' + MONO;
+  ctx.fillText('D: switch mode      1-5: replay a recent run', CONFIG.LOGICAL_W / 2, 444);
+  if (game.mode !== 'daily' && game.mode !== 'zen') {
     ctx.fillText('Seed ' + game.lastSeed + '   (open with #seed=' + game.lastSeed + ' to replay)',
-                 CONFIG.LOGICAL_W / 2, 460);
+                 CONFIG.LOGICAL_W / 2, 466);
   }
 }
 
@@ -2143,6 +2539,10 @@ const KEY_HELP = [
   ['- and =', 'Volume down / up'],
   ['C', 'Letter overlay on blocks'],
   ['S', 'Copy result (game over)'],
+  ['X', 'Copy result card image'],
+  ['G', 'Ghost racer on / off'],
+  ['[ and ]', 'Zen practice speed'],
+  ['GAMEPAD', 'A flap, B rotate, Start pause'],
   ['B', 'Badge gallery (between runs)'],
   ['T', 'Tuning panel (dev)'],
   ['?', 'This help'],
@@ -2221,11 +2621,16 @@ function drawPauseOverlay() {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.font = 'bold 56px ' + MONO;
-  ctx.fillText('PAUSED', CONFIG.LOGICAL_W / 2, 230);
-  ctx.font = 'bold 20px ' + MONO;
-  ctx.fillText('Press P to resume', CONFIG.LOGICAL_W / 2, 300);
-  ctx.font = '16px ' + MONO;
-  ctx.fillText('Esc: End run', CONFIG.LOGICAL_W / 2, 336);
+  ctx.fillText('PAUSED', CONFIG.LOGICAL_W / 2, 216);
+  uiButtonRow(284, [
+    ['RESUME', togglePause],
+    ['RESTART', pauseRestart],
+    ['TITLE', pauseToTitle],
+    ['HELP ?', () => { game.helpOpen = true; }],
+  ], 124, 30, 12, { font: 'bold 13px ' });
+  ctx.fillStyle = CONFIG.INK;
+  ctx.font = '15px ' + MONO;
+  ctx.fillText('P: resume      Esc: end run', CONFIG.LOGICAL_W / 2, 350);
 }
 
 function drawResumeOverlay() {
@@ -2253,7 +2658,7 @@ function render() {
   // logical coordinate transform (dpr * fit-scale, letterbox offset)
   ctx.setTransform(view.s, 0, 0, view.s, view.tx, view.ty);
 
-  // playfield background, ambient parallax, then the level wash on top
+  // screen background, ambient parallax, then the level wash on top
   ctx.fillStyle = CONFIG.BG;
   ctx.fillRect(0, 0, CONFIG.LOGICAL_W, CONFIG.LOGICAL_H);
   drawBackdrop();
@@ -2271,22 +2676,37 @@ function render() {
     ctx.translate((Math.random() * 2 - 1) * m, (Math.random() * 2 - 1) * m);
   }
 
-  if (game.state === 'START') drawTitleDrift();
+  if (game.state === 'START') {
+    // after enough idle the self-playing demo takes over from the drift
+    const now = performance.now();
+    attract.on = !REDUCED_MOTION && now - game.idleAt > CONFIG.ATTRACT_MS;
+    if (attract.on) {
+      const adt = attract.lastT ? Math.min(0.05, (now - attract.lastT) / 1000) : 0.016;
+      attractStep(adt);
+      drawAttract();
+    } else {
+      drawTitleDrift();
+    }
+    attract.lastT = now;
+  }
 
   if (game.state !== 'START') {
     drawObstacle();
   }
   drawWell();
-  drawStack();
-  drawDanger();
+  if (!attract.on || game.state !== 'START') drawStack();
+  // the danger band reflects a live run; the title shows only leftovers
+  if (game.state !== 'START') drawDanger();
   drawClearFlash();
-  if (game.state === 'FLYING' || game.state === 'PAUSED' || game.state === 'RESUMING') drawGhost();
+  if (game.state === 'FLYING' || game.state === 'PAUSED' || game.state === 'RESUMING') {
+    drawGhost();
+    drawGhostRun();
+  }
   if (game.state !== 'START') {
     if (game.state === 'FLYING') drawTrail();
     drawPiece();
     drawHUD();
     if (game.state === 'FLYING') drawTutorial();
-    drawFloaters();
     drawParticles();
     drawHitFlash();
   }
@@ -2310,6 +2730,9 @@ function render() {
       }
     }
   }
+  // floaters draw above the overlays so copy/volume feedback stays readable
+  // on the game over and pause screens
+  if (game.state !== 'START') drawFloaters();
   drawToasts();
   if (game.helpOpen) drawHelpOverlay();
   else if (game.badgesOpen) drawBadgesOverlay();
@@ -2333,6 +2756,8 @@ function frame(now) {
   let dt = now - lastTime;
   lastTime = now;
   if (dt > 250) dt = 250; // avoid a spiral of death after a tab stall
+
+  pollGamepad();
 
   // unpause countdown: burns down on rendered time only, so a rAF stall
   // (occluded window, display sleep) freezes it exactly like physics
@@ -2364,13 +2789,20 @@ function frame(now) {
 // Input
 // ---------------------------------------------------------------------------
 
+// Restart stays blocked until the score screen has actually been shown:
+// deaths hold through the beat plus the fade, victory finishes skip the beat.
+function goLockoutMs() {
+  return game.finish ? CONFIG.GAMEOVER_LOCKOUT
+    : Math.max(CONFIG.GAMEOVER_LOCKOUT, CONFIG.DEATH_BEAT_MS + 150);
+}
+
 function primaryAction() {
   if (game.state === 'START') {
     startRun();
   } else if (game.state === 'FLYING') {
     flap();
   } else if (game.state === 'GAMEOVER') {
-    if (performance.now() - game.gameOverAt >= CONFIG.GAMEOVER_LOCKOUT) startRun();
+    if (performance.now() - game.gameOverAt >= goLockoutMs()) startRun();
   }
 }
 
@@ -2435,7 +2867,7 @@ function toggleTunePanel() {
     row.appendChild(input);
     el.appendChild(row);
   }
-  const btnCss = 'font:12px ' + MONO + ';margin-right:6px;background:#2b3444;' +
+  const btnCss = 'font:12px ' + MONO + ';margin-right:6px;background:rgba(237,232,220,0.08);' +
     'color:#EDE8DC;border:1px solid #39424E;border-radius:4px;padding:3px 8px;cursor:pointer;';
   const copyBtn = document.createElement('button');
   copyBtn.textContent = 'copy diff';
@@ -2480,6 +2912,7 @@ window.addEventListener('keydown', (e) => {
   // let the tuning panel's controls keep their own keyboard behavior
   if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' ||
                    e.target.tagName === 'TEXTAREA')) return;
+  game.idleAt = performance.now();
   // an open help or badge panel swallows the keyboard until it is closed
   if (game.helpOpen || game.badgesOpen) {
     if (e.code === 'Space' || e.key === 'Escape' || e.code === 'Slash' ||
@@ -2500,28 +2933,40 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     dive();
   } else if (e.code === 'Slash') {
-    // help from anywhere; opening it mid-flight parks the run in pause
+    // help from anywhere; opening it mid-flight or mid-countdown parks the
+    // run in pause so it can never resume behind the panel
     e.preventDefault();
-    if (game.state === 'FLYING') game.state = 'PAUSED';
+    if (game.state === 'FLYING' || game.state === 'RESUMING') game.state = 'PAUSED';
     game.helpOpen = true;
   } else if (e.key === 'b' || e.key === 'B') {
     e.preventDefault();
-    if (game.state === 'START' || game.state === 'GAMEOVER') game.badgesOpen = true;
+    if (betweenRuns()) game.badgesOpen = true;
   } else if (e.code === 'Minus' || e.code === 'Equal') {
     e.preventDefault();
     setVolume(audio.vol + (e.code === 'Minus' ? -0.1 : 0.1));
     addFloater(CONFIG.LOGICAL_W / 2, 130, 'VOL ' + Math.round(audio.vol * 100) + '%');
   } else if (e.key === 'p' || e.key === 'P' || e.code === 'KeyP') {
     e.preventDefault();
-    if (game.state === 'FLYING') {
-      game.state = 'PAUSED';
-    } else if (game.state === 'PAUSED') {
-      // resume through a short countdown instead of instantly
-      game.state = 'RESUMING';
-      game.resumeLeft = CONFIG.RESUME_MS;
-      game.lastCount = 0;
-    } else if (game.state === 'RESUMING') {
-      game.state = 'PAUSED';
+    togglePause();
+  } else if (e.key === 'x' || e.key === 'X') {
+    e.preventDefault();
+    copyCard();
+  } else if (e.key === 'g' || e.key === 'G') {
+    e.preventDefault();
+    ghostHidden = !ghostHidden;
+    lsSet('flapstack.ghostoff', ghostHidden ? '1' : '0');
+    if (game.state !== 'START') {
+      addFloater(CONFIG.LOGICAL_W / 2, 130, ghostHidden ? 'GHOST OFF' : 'GHOST ON');
+    }
+  } else if (e.code === 'BracketLeft' || e.code === 'BracketRight') {
+    e.preventDefault();
+    // zen practice speed control; a fixed pace is part of every other mode
+    if (game.mode === 'zen' && (game.state === 'FLYING' || game.state === 'PAUSED')) {
+      const v = Math.max(60, Math.min(260,
+        game.scrollSpeed + (e.code === 'BracketRight' ? 10 : -10)));
+      game.scrollSpeed = v;
+      lsSet('flapstack.zenspeed', String(v));
+      addFloater(CONFIG.LOGICAL_W / 2, 130, 'SPEED ' + v);
     }
   } else if (e.key === 'h' || e.key === 'H' || e.key === 'Shift') {
     e.preventDefault();
@@ -2573,6 +3018,7 @@ function eventPoint(e) {
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault();
   canvas.focus();
+  game.idleAt = performance.now();
   // an open panel closes on any click, and never leaks one to the buttons
   if (game.helpOpen || game.badgesOpen) {
     game.helpOpen = false;
@@ -2636,6 +3082,15 @@ window.__game = {
   get attackBest() { return game.attackBest; },
   get tutStep() { return game.tut ? game.tut.step : null; },
   get trailLength() { return game.trail.length; },
+  get ghostRace() {
+    return game.ghostRun
+      ? { t: game.ghostRun.t, score: game.ghostRun.score, samples: game.ghostRun.rec.length }
+      : null;
+  },
+  get recLength() { return game.rec.length; },
+  get attractOn() { return attract.on; },
+  padStep: padStep,
+  togglePause: togglePause,
   holdSwap: tryHold,
   toggleMode: toggleMode,
   setMode: setMode,
@@ -2781,7 +3236,7 @@ function runTestSuite() {
 
   T('entrance side-hit crashes', () => {
     G.start(); clearWell();
-    for (let r = 8; r < W.rows; r++) G.grid[r][0] = '#888';
+    for (let r = 8; r < W.rows; r++) G.grid[r][0] = '#8A8F98';
     CONFIG.GRAVITY = 0;
     G.setPiece(0, 0, W.x - 4 * W.cell - 10, W.y + 10 * W.cell, 0);
     let res = null;
@@ -2813,7 +3268,7 @@ function runTestSuite() {
 
   T('top-out ends despite full hearts', () => {
     G.start(); clearWell();
-    for (let r = 3; r < W.rows; r++) G.grid[r][4] = '#888';
+    for (let r = 3; r < W.rows; r++) G.grid[r][4] = '#8A8F98';
     G.setPiece(1, 0, W.x + 4 * W.cell, W.y + 1, 150);
     let topped = false;
     for (let s = 0; s < 60; s++) {
@@ -2848,7 +3303,7 @@ function runTestSuite() {
 
   T('rise into occupied top row is a top-out', () => {
     G.start(); clearWell();
-    G.grid[0][3] = '#888';
+    G.grid[0][3] = '#8A8F98';
     CONFIG.RISE_START = G.stats.pieces + 1;
     G.setPiece(1, 0, W.x + 5 * W.cell, W.b - 2 * W.cell - 3, 200);
     let ended = false;
@@ -2929,7 +3384,7 @@ function runTestSuite() {
 
   T('wall kick: blocked rotation succeeds shifted', () => {
     G.start(); clearWell();
-    for (let r = 8; r < W.rows; r++) G.grid[r][7] = '#888';
+    for (let r = 8; r < W.rows; r++) G.grid[r][7] = '#8A8F98';
     G.setPiece(0, 1, W.x + 5 * W.cell, W.y + 10 * W.cell, 0);
     const rot0 = G.piece.rot;
     press('KeyR', 'r');
@@ -2945,7 +3400,7 @@ function runTestSuite() {
     for (let s = 0; s < 60; s++) G.step(DT);
     ok(G.lives === 3, 'heart lost in zen');
     clearWell();
-    for (let r = 3; r < W.rows; r++) G.grid[r][4] = '#888';
+    for (let r = 3; r < W.rows; r++) G.grid[r][4] = '#8A8F98';
     G.setPiece(1, 0, W.x + 4 * W.cell, W.y + 1, 150);
     let swept = false;
     for (let s = 0; s < 80; s++) {
@@ -2954,6 +3409,7 @@ function runTestSuite() {
       if (G.lockEvents.length > 0 && G.grid.every(row => row.every(c => c === null))) { swept = true; break; }
     }
     ok(swept && G.state === 'FLYING', 'zen top-out did not sweep');
+    ok(G.danger === false, 'danger flag stuck after the zen sweep');
     press('Escape', 'Escape');
     toMode('free');
   });
@@ -3122,6 +3578,16 @@ function runTestSuite() {
     ok(G.helpOpen === false && G.state === 'PAUSED', 'esc hit the run, not the panel');
     press('Escape', 'Escape');
     ok(G.state === 'GAMEOVER', 'second esc should end the run');
+    // opening help mid-countdown must also park, or the run resumes
+    // invisibly behind the panel
+    G.start();
+    press('KeyP', 'p');
+    press('KeyP', 'p');
+    ok(G.state === 'RESUMING', 'countdown not armed');
+    press('Slash', '?');
+    ok(G.helpOpen === true && G.state === 'PAUSED', 'help left the countdown burning');
+    press('Escape', 'Escape');
+    press('Escape', 'Escape');
   });
 
   T('first-run hints advance and retire for good', () => {
@@ -3142,15 +3608,140 @@ function runTestSuite() {
     life.games = g0;
   });
 
-  T('trail samples per flight, cleared on lock', () => {
+  T('trail samples only at speed, cleared on lock', () => {
+    if (REDUCED_MOTION) return; // sampling is disabled entirely then
     toMode('free');
     G.start();
+    for (let s = 0; s < 8; s++) G.step(DT);
+    ok(G.trailLength === 0, 'sampled below the trail speed');
+    game.scrollSpeed = CONFIG.TRAIL_MIN_SPEED;
     for (let s = 0; s < 8; s++) G.step(DT);
     ok(G.trailLength > 0, 'no samples collected');
     clearWell();
     G.setPiece(1, 0, W.x + 2 * W.cell, W.b - 2 * W.cell - 3, 200);
     runTo(40);
     ok(G.trailLength === 0, 'not cleared: ' + G.trailLength);
+  });
+
+  T('zen history replays use the recorded seed', () => {
+    toMode('zen');
+    G.start();
+    const seed = G.lastSeed;
+    clearingLock(5);
+    press('Escape', 'Escape');
+    ok(runHistory[0] && runHistory[0].mode === 'zen', 'zen run not in history');
+    press('Digit1', '1');
+    ok(G.state === 'FLYING' && G.mode === 'zen' && G.lastSeed === seed,
+       'zen replay seed mismatch: ' + G.lastSeed + ' vs ' + seed);
+    press('Escape', 'Escape');
+    toMode('free');
+  });
+
+  T('pause menu: restart and title bank the run quietly', () => {
+    toMode('free');
+    G.start();
+    const games0 = life.games;
+    togglePause();
+    ok(G.state === 'PAUSED', 'not paused');
+    pauseRestart();
+    ok(G.state === 'FLYING' && life.games === games0 + 1, 'restart did not bank the run');
+    togglePause();
+    pauseToTitle();
+    ok(G.state === 'START' && life.games === games0 + 2, 'title did not bank the run');
+  });
+
+  T('gamepad: edges fire once, start toggles pause', () => {
+    toMode('free');
+    G.start();
+    G.padStep({});
+    G.padStep({ 0: true });
+    ok(G.piece.vy === CONFIG.FLAP_VY, 'pad flap failed: ' + G.piece.vy);
+    G.step(DT);
+    const v1 = G.piece.vy;
+    G.padStep({ 0: true }); // still held: must not re-fire
+    ok(G.piece.vy === v1, 'held button re-fired');
+    G.padStep({ 0: false });
+    G.padStep({ 9: true });
+    ok(G.state === 'PAUSED', 'pad pause failed');
+    G.padStep({ 9: false });
+    G.padStep({ 9: true });
+    ok(G.state === 'RESUMING', 'pad resume failed');
+    G.padStep({});
+    press('Escape', 'Escape');
+    // with a panel up, a pad press only closes the panel
+    G.start();
+    press('KeyP', 'p');
+    press('Slash', '?');
+    ok(G.helpOpen === true && G.state === 'PAUSED', 'panel setup failed');
+    G.padStep({ 9: true });
+    ok(G.helpOpen === false && G.state === 'PAUSED', 'pad start leaked through the panel');
+    G.padStep({});
+    press('Escape', 'Escape');
+  });
+
+  T('ghost race: best attempt replays on the same seed', () => {
+    try { localStorage.removeItem('flapstack.ghosts'); } catch (e) {}
+    ghostCache = null; // drop the cache along with the key
+    game.customSeed = 4242;
+    toMode('seed');
+    G.start();
+    for (let s = 0; s < 150; s++) {
+      if (s % 8 === 0) G.flap();
+      G.step(DT);
+    }
+    ok(G.recLength >= 10, 'too few samples: ' + G.recLength);
+    clearingLock(5);
+    press('Escape', 'Escape');
+    ok(!!lsGet('flapstack.ghosts'), 'ghost not saved');
+    G.start(); // same seed
+    ok(!!G.ghostRace && G.ghostRace.samples >= 10, 'ghost not armed');
+    const t0 = G.ghostRace.t;
+    for (let s = 0; s < 10; s++) G.step(DT);
+    ok(G.ghostRace.t > t0, 'ghost clock frozen');
+    press('Escape', 'Escape');
+    game.customSeed = null;
+    toMode('free');
+  });
+
+  T('result card is a 640x360 image with pixels', () => {
+    toMode('free');
+    G.start();
+    clearingLock(5);
+    press('Escape', 'Escape');
+    const card = buildResultCard();
+    ok(card.width === 640 && card.height === 360, 'bad size');
+    ok(card.toDataURL('image/png').length > 2000, 'card looks empty');
+  });
+
+  T('zen practice speed keys adjust, clamp, persist', () => {
+    try { localStorage.removeItem('flapstack.zenspeed'); } catch (e) {}
+    toMode('zen');
+    G.start();
+    const s0 = G.scrollSpeed;
+    press('BracketRight', ']');
+    ok(G.scrollSpeed === s0 + 10, 'speed up failed');
+    press('BracketLeft', '[');
+    press('BracketLeft', '[');
+    ok(G.scrollSpeed === s0 - 10, 'speed down failed');
+    ok(lsGet('flapstack.zenspeed') === String(s0 - 10), 'not persisted');
+    press('Escape', 'Escape');
+    toMode('free');
+    G.start();
+    ok(G.scrollSpeed === CONFIG.SCROLL_START, 'zen speed leaked into free');
+    press('Escape', 'Escape');
+  });
+
+  T('attract demo stacks pieces without touching the game', () => {
+    const games0 = life.games, score0 = G.score;
+    attractReset();
+    let steps = 0;
+    while (steps < 6000 && attract.grid.every(row => row.every(c => !c))) {
+      attractStep(DT);
+      steps++;
+    }
+    ok(attract.grid.some(row => row.some(c => !!c)), 'no cells after ' + steps + ' steps');
+    ok(life.games === games0 && G.score === score0, 'attract touched real state');
+    attractReset();
   });
 
   T('stability: 1200 random steps, all locks supported', () => {
@@ -3169,6 +3760,11 @@ function runTestSuite() {
   const results = [];
   let passed = 0;
   for (const t of tests) {
+    // per-test reset: quietly end any run the previous test left live and
+    // normalize shared state, so tests cannot poison each other
+    if (game.state !== 'START' && game.state !== 'GAMEOVER') gameOver('', true);
+    game.mode = 'free';
+    game.toasts.length = 0;
     try {
       t[1]();
       results.push({ name: t[0], pass: true });
@@ -3187,31 +3783,26 @@ function runTestSuite() {
     for (const k in savedStorage) localStorage.setItem(k, savedStorage[k]);
   } catch (e) {}
   for (const k in savedConfig) CONFIG[k] = savedConfig[k];
-  // and the in-memory mirrors of that storage
+  // and the in-memory mirrors, via the exact loaders boot uses so the
+  // post-suite state can never drift from what a fresh page load would read
   loadBadges();
   streakN = loadStreak().n;
-  try {
-    const raw = JSON.parse(lsGet('flapstack.life') || '{}');
-    for (const k in life) life[k] = typeof raw[k] === 'number' ? raw[k] : 0;
-  } catch (e) {}
-  try {
-    runHistory = JSON.parse(lsGet('flapstack.history') || '[]');
-    if (!Array.isArray(runHistory)) runHistory = [];
-  } catch (e) { runHistory = []; }
-  {
-    const v = parseFloat(lsGet('flapstack.vol'));
-    audio.vol = v >= 0 && v <= 1 ? v : 1;
-    if (audio.master) audio.master.gain.value = audio.vol;
-  }
-  game.best = parseInt(lsGet('flapstack.best'), 10) || 0;
-  game.sprintBest = parseFloat(lsGet('flapstack.sprint')) || 0;
-  game.attackBest = parseInt(lsGet('flapstack.attack'), 10) || 0;
-  loadDailyBest();
+  loadLife();
+  loadHistory();
+  loadVolume();
+  loadRecords();
+  ghostCache = null; // lazily re-read from the restored storage
+  ghostHidden = lsGet('flapstack.ghostoff') === '1';
+  game.ghostRun = null;
   game.toasts.length = 0;
+  // tests plant custom seeds; restore the URL-derived value (or none)
+  game.customSeed = null;
+  applySeedHash();
   // park on the title screen so the run the tests abandoned cannot keep
   // flying, die on its own, and write records into the restored storage
   game.state = 'START';
   game.mode = 'free';
+  game.idleAt = performance.now();
 
   window.__testResults = { total: tests.length, passed: passed, failed: tests.length - passed, results: results };
 

@@ -28,10 +28,13 @@ One file, zero dependencies, Canvas 2D. Open it and play.
 | M / N | Sound / music on-off |
 | - / = | Volume |
 | C | Letter overlay on blocks (colorblind aid) |
-| S | Copy shareable result (game over) |
+| S / X | Copy shareable result text / PNG result card (game over) |
+| G | Ghost racer on-off |
+| [ / ] | Practice speed (zen only) |
 | B | Badge gallery |
 | ? | Help overlay with this key map |
 | T | Live tuning panel (dev) |
+| Gamepad | A flap, B/X rotate, Y hold, down dive, Start pause |
 
 Press `?` in the game for the same list.
 
@@ -46,6 +49,8 @@ Press `?` in the game for the same list.
 - **Attack** - best score in 2:00.
 - **Seed** - open `index.html#seed=12345` to replay any exact run. Every game
   over screen and shared result includes its seed.
+- **Ghost race** - replaying a seed you have played before (daily included)
+  spawns your best attempt as a translucent racer flying its recorded path.
 
 ## Details
 
@@ -57,16 +62,19 @@ Press `?` in the game for the same list.
 - Wall and stack side contact inside the well settles the piece down into
   place instead of killing you; the well ceiling bumps instead of killing.
 - WebAudio synth for all sound and generative music - no asset files.
+- Idle on the title screen long enough and the game starts demoing itself.
 - Persistent (localStorage): bests per mode, daily bests and streak, badges,
-  lifetime stats, last five runs, sound/music/volume/letter preferences.
-- Respects `prefers-reduced-motion` (no shake, debris, trails, or drift).
+  ghost recordings, lifetime stats, last five runs, sound/music/volume/letter
+  preferences.
+- Installable (inline web app manifest); respects `prefers-reduced-motion`
+  (no shake, debris, trails, drift, or attract demo).
 
 ## Development
 
 The whole game is `index.html` - inline CSS and JS, no build step.
 
 - **Test suite:** open `index.html?test=1` to run the in-page regression suite
-  (37 tests: physics, scoring, modes, input, stability). Results render in a
+  (44 tests: physics, scoring, modes, input, stability). Results render in a
   panel and in `window.__testResults`. Storage and constants are snapshotted
   and restored.
 - **Tuning panel:** press `T` for live sliders over the feel constants
