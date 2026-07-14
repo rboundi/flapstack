@@ -105,6 +105,12 @@ const CONFIG = {
   RESUME_MS: 1500,        // unpause countdown length
   DEATH_BEAT_MS: 450,     // hold on the final crash before the overlay fades in
 
+  DIVE_VY: 420,           // instant downward velocity set on dive (Down arrow)
+  SPRINT_LINES: 10,       // sprint mode: first to this many lines
+  ATTACK_TIME: 120,       // time attack length in seconds
+  LEVEL_LINES: 10,        // lines cleared per level
+  TRAIL_MIN_SPEED: 150,   // scroll speed where the motion trail fades in
+
   SETTLE_DROP: 1100,      // px/s vertical glide of the wall landing
   SETTLE_SLIDE: 320,      // px/s horizontal align of the wall landing
 
@@ -127,6 +133,12 @@ const CONFIG = {
 
 // single source for the HUD/UI typeface stack; sizes are prepended per use
 const MONO = 'ui-monospace, Menlo, Consolas, monospace';
+
+// shown small on the title screen so bug reports can name a build
+const VERSION = 'v0.6.0';
+
+// per-level backdrop wash, reusing the piece palette so no new hues appear
+const LEVEL_TINTS = ['#4C86E8', '#7B6CB2', '#2D9C8A', '#8AA84C', '#E8B84C', '#C24C8A', '#E8604C'];
 
 // pristine copy of the constants, for the tuning panel's diff and reset
 const CONFIG_DEFAULTS = JSON.parse(JSON.stringify(CONFIG));
@@ -209,8 +221,14 @@ const game = {
   newBest: false,
   bestBeaten: false,     // the mid-run ticker fired against recordFor(mode)
   combo: 0,              // consecutive clearing flights
-  stats: { pieces: 0, passes: 0, bestCombo: 1, allClears: 0 },
+  stats: { pieces: 0, passes: 0, bestCombo: 1, allClears: 0, cleans: 0 },
   playTime: 0,           // seconds of physics simulated this run
+  level: 1,              // 1 + lines/LEVEL_LINES, drives the backdrop wash
+  attackLeft: 0,         // seconds left in a time attack run
+  lastAttackSec: 0,      // for the final-seconds tick
+  finish: '',            // victory label on the game over screen, '' for a death
+  sprintBest: 0,         // fastest sprint finish in seconds, 0 when unset
+  attackBest: 0,         // highest time attack score
   scrollSpeed: CONFIG.SCROLL_START,
   obstacleGap: CONFIG.GAP,
   rng: null,             // seeded PRNG for the bag and obstacle rolls
@@ -228,6 +246,9 @@ const game = {
   resumeLeft: 0,         // ms remaining in the unpause countdown
   lastCount: 0,
   cbMode: false,         // letter overlay on blocks
+  helpOpen: false,       // key map overlay
+  badgesOpen: false,     // badge gallery overlay
+  tut: null,             // first-run hints: { step, flaps, at } or null
   settle: null,          // { tx, ty } while gliding into a wall landing
   gameOverAt: 0,
   hitAt: 0,              // timestamp of the last life loss, for the red flash
@@ -241,6 +262,10 @@ const game = {
   shakeMag: 0,
   rotAnim: null,         // { from: blocks, at } render-only rotation tween
   flapAt: 0,             // render-only squash pulse
+  diveAt: 0,             // render-only stretch pulse
+  trail: [],             // recent piece block positions for the motion trail
+  toasts: [],            // sliding top banners: { text, at }
+  uiButtons: [],         // clickable overlay rects, rebuilt every render
   lockEvents: [],        // debug log of each lock: { cells, supported }
 };
 
@@ -281,9 +306,12 @@ function loadDailyBest() {
   game.dailyBest = parseInt(lsGet('flapstack.daily.' + dailyDateStr()), 10) || 0;
 }
 
-// the record the current mode plays against (seed replays have none)
+// the record the current mode plays against. Seed replays and zen have none,
+// and sprint races a time rather than a score so it also returns 0 here.
 function recordFor(mode) {
-  return mode === 'daily' ? game.dailyBest : mode === 'free' ? game.best : 0;
+  return mode === 'daily' ? game.dailyBest
+    : mode === 'attack' ? game.attackBest
+    : mode === 'free' ? game.best : 0;
 }
 
 function fmtClock(seconds) {
@@ -293,6 +321,8 @@ function fmtClock(seconds) {
 
 game.rng = mulberry32((Math.random() * 0xFFFFFFFF) >>> 0);
 game.best = parseInt(lsGet('flapstack.best'), 10) || 0;
+game.sprintBest = parseFloat(lsGet('flapstack.sprint')) || 0;
+game.attackBest = parseInt(lsGet('flapstack.attack'), 10) || 0;
 loadDailyBest();
 
 // a #seed=12345 URL replays that exact run (seed mode). Re-applied on every
@@ -335,6 +365,7 @@ function bumpStreak() {
     lsSet('flapstack.streak', JSON.stringify(s));
   }
   streakN = s.n;
+  if (streakN >= 5) award('streak-five');
 }
 streakN = loadStreak().n;
 
@@ -356,6 +387,45 @@ function pushHistory() {
   lsSet('flapstack.history', JSON.stringify(runHistory));
 }
 
+// sliding banner across the top, used for badge unlocks
+function addToast(text) {
+  game.toasts.push({ text: text, at: performance.now() });
+  if (game.toasts.length > 3) game.toasts.shift();
+}
+
+// Badges: one-time feats, persisted with the date they were earned. Zen is
+// practice, so nothing unlocks there.
+const BADGES = [
+  ['first-flight', 'FIRST FLIGHT', 'Finish a run'],
+  ['first-clear', 'BREAKING GROUND', 'Clear a row'],
+  ['quad', 'QUAD', 'Clear four rows at once'],
+  ['all-clear', 'SPOTLESS', 'Empty the well'],
+  ['combo-max', 'HEATING UP', 'Reach a x3 combo'],
+  ['clean-five', 'THREAD THE NEEDLE', 'Five clean passes in one run'],
+  ['five-min', 'MARATHON', 'Survive five minutes in one run'],
+  ['grand', 'GRAND', 'Score 1000 in one run'],
+  ['streak-five', 'REGULAR', 'Reach a five day daily streak'],
+  ['hearts-full', 'FULL HEALTH', 'Hold five hearts at once'],
+];
+let badges = {};
+function loadBadges() {
+  try {
+    const raw = JSON.parse(lsGet('flapstack.badges') || '{}');
+    badges = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  } catch (e) { badges = {}; }
+}
+loadBadges();
+
+function award(id) {
+  if (game.mode === 'zen' || badges[id]) return;
+  const b = BADGES.find(x => x[0] === id);
+  if (!b) return;
+  badges[id] = dailyDateStr();
+  lsSet('flapstack.badges', JSON.stringify(badges));
+  addToast('BADGE  ' + b[1]);
+  SFX.badge();
+}
+
 // letter overlay for colorblind support: shape initial per block color
 const COLOR_LETTER = {};
 for (const s of SHAPES) COLOR_LETTER[s.color] = s.name;
@@ -368,13 +438,22 @@ const REDUCED_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduc
 // The context is created lazily on the first sound after a user gesture.
 // ---------------------------------------------------------------------------
 
-const audio = { ctx: null, muted: false };
+const audio = { ctx: null, muted: false, master: null, vol: 1 };
 audio.muted = lsGet('flapstack.muted') === '1';
+{
+  const v = parseFloat(lsGet('flapstack.vol'));
+  audio.vol = v >= 0 && v <= 1 ? v : 1;
+}
 
 function audioContext() {
   if (!audio.ctx) {
-    try { audio.ctx = new (window.AudioContext || window.webkitAudioContext)(); }
-    catch (e) { audio.ctx = null; }
+    try {
+      audio.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // every note routes through one master gain so - / = scale it all
+      audio.master = audio.ctx.createGain();
+      audio.master.gain.value = audio.vol;
+      audio.master.connect(audio.ctx.destination);
+    } catch (e) { audio.ctx = null; audio.master = null; }
   }
   if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
   return audio.ctx;
@@ -383,6 +462,12 @@ function audioContext() {
 function toggleMute() {
   audio.muted = !audio.muted;
   lsSet('flapstack.muted', audio.muted ? '1' : '0');
+}
+
+function setVolume(v) {
+  audio.vol = Math.max(0, Math.min(1, Math.round(v * 10) / 10));
+  lsSet('flapstack.vol', String(audio.vol));
+  if (audio.master) audio.master.gain.value = audio.vol;
 }
 
 // Gentle generative backing loop: a pentatonic random walk over a slow bass,
@@ -403,6 +488,9 @@ function scheduleMusic() {
   if (ac.state !== 'running') return;
   if (music.nextTime < ac.currentTime) music.nextTime = ac.currentTime + 0.05;
   const stackFrac = (WELL_ROWS - topOccupiedRow()) / WELL_ROWS;
+  // while the stack is in the danger rows the loop tightens and picks up an
+  // off-beat pulse, so the pressure is audible before the top-out
+  const stepDur = game.danger ? 0.24 : 0.32;
   while (music.nextTime < ac.currentTime + 0.4) {
     const dly = music.nextTime - ac.currentTime;
     const beat = music.beat % 8;
@@ -414,8 +502,11 @@ function scheduleMusic() {
     if (stackFrac > 0.45 && beat % 2 === 1 && Math.random() < 0.5) {
       tone(dly, MUSIC_SCALE[music.walkIx] * 2, 0.12, 'triangle', 0.022);
     }
+    if (game.danger && beat % 2 === 1) {
+      tone(dly, MUSIC_SCALE[music.walkIx] * 2, 0.08, 'square', 0.016);
+    }
     music.beat += 1;
-    music.nextTime += 0.32;
+    music.nextTime += stepDur;
   }
 }
 
@@ -433,7 +524,7 @@ function tone(delay, freq, dur, type, vol, slideTo) {
   g.gain.setValueAtTime(vol, t0);
   g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
   osc.connect(g);
-  g.connect(ac.destination);
+  g.connect(audio.master || ac.destination);
   osc.start(t0);
   osc.stop(t0 + dur + 0.03);
 }
@@ -460,6 +551,10 @@ const SFX = {
   rise()   { tone(0, 90, 0.28, 'sawtooth', 0.12, 150); },
   warn()   { tone(0, 230, 0.16, 'square', 0.10); tone(0.22, 230, 0.16, 'square', 0.10); },
   gameOver() { tone(0, 392, 0.5, 'sawtooth', 0.12, 90); tone(0.12, 196, 0.6, 'sawtooth', 0.09, 60); },
+  dive()   { tone(0, 420, 0.08, 'triangle', 0.08, 210); },
+  badge()  { tone(0, 880, 0.08, 'triangle', 0.10); tone(0.07, 1175, 0.16, 'triangle', 0.10); },
+  level()  { tone(0, 523, 0.09, 'triangle', 0.10); tone(0.07, 659, 0.09, 'triangle', 0.10); tone(0.14, 880, 0.15, 'triangle', 0.12); },
+  finish() { const n = [523, 659, 784, 1047]; for (let i = 0; i < n.length; i++) tone(i * 0.09, n[i], 0.2, 'triangle', 0.12); },
 };
 
 // ---------------------------------------------------------------------------
@@ -545,6 +640,7 @@ function spawnPiece() {
   game.passed = false;
   game.canHold = true;
   game.rotAnim = null;
+  game.trail = [];
   newObstacles();
 }
 
@@ -562,8 +658,12 @@ function startRun() {
   game.bestBeaten = false;
   game.danger = false;
   game.combo = 0;
-  game.stats = { pieces: 0, passes: 0, bestCombo: 1, allClears: 0 };
+  game.stats = { pieces: 0, passes: 0, bestCombo: 1, allClears: 0, cleans: 0 };
   game.playTime = 0;
+  game.level = 1;
+  game.finish = '';
+  game.attackLeft = game.mode === 'attack' ? CONFIG.ATTACK_TIME : 0;
+  game.lastAttackSec = 0;
   game.scrollSpeed = CONFIG.SCROLL_START;
   game.obstacleGap = CONFIG.GAP;
   game.bag = [];
@@ -575,6 +675,12 @@ function startRun() {
   game.settle = null;
   game.hitAt = 0;
   game.respawnAt = 0;
+  game.trail = [];
+  game.helpOpen = false;
+  game.badgesOpen = false;
+  // first-run hints: only for a player with no finished games, in free play
+  game.tut = (game.mode === 'free' && life.games === 0 && lsGet('flapstack.tut') !== '1')
+    ? { step: 0, flaps: 0, at: performance.now() } : null;
   newBag();
   game.nextQueue = [];
   for (let i = 0; i < CONFIG.NEXT_COUNT; i++) game.nextQueue.push(nextFromBag());
@@ -600,25 +706,53 @@ function copyResult() {
   }
 }
 
-// Daily mode reruns the same seeded sequence for everyone on the same date;
-// seed mode (via a #seed= URL) replays one specific run; zen is pipeless,
-// deathless practice. Toggling is only allowed between runs and cycles
-// free -> daily -> seed (when present) -> zen -> free.
-function toggleMode() {
+// replay a recent run by its seed (title digits 1-5 and the clickable rows).
+// Zen runs replay in zen; everything else replays as a plain seed run.
+function replayHistory(i) {
   if (game.state !== 'START' && game.state !== 'GAMEOVER') return;
-  if (game.mode === 'free') game.mode = 'daily';
-  else if (game.mode === 'daily') game.mode = game.customSeed !== null ? 'seed' : 'zen';
-  else if (game.mode === 'seed') game.mode = 'zen';
-  else game.mode = 'free';
-  if (game.mode === 'daily') loadDailyBest();
+  const h = runHistory[i];
+  if (!h) return;
+  game.customSeed = h.seed >>> 0;
+  game.mode = h.mode === 'zen' ? 'zen' : 'seed';
+  startRun();
 }
 
-function gameOver() {
+// Daily mode reruns the same seeded sequence for everyone on the same date;
+// seed mode (via a #seed= URL) replays one specific run; zen is pipeless,
+// deathless practice; sprint races to SPRINT_LINES; attack is best score in
+// ATTACK_TIME seconds. Switching is only allowed between runs, via the title
+// screen buttons or by cycling with D.
+function modeList() {
+  const m = ['free', 'daily'];
+  if (game.customSeed !== null) m.push('seed');
+  m.push('zen', 'sprint', 'attack');
+  return m;
+}
+
+function setMode(m) {
+  if (game.state !== 'START' && game.state !== 'GAMEOVER') return;
+  game.mode = m;
+  if (m === 'daily') loadDailyBest();
+}
+
+function toggleMode() {
+  const list = modeList();
+  setMode(list[(list.indexOf(game.mode) + 1) % list.length]);
+}
+
+// finish, when given, is a victory label (sprint target reached, attack timer
+// out): the crash beat and death sting are skipped and the overlay says so.
+function gameOver(finish) {
   if (game.state === 'GAMEOVER') return;
   game.state = 'GAMEOVER';
+  game.finish = finish || '';
   game.gameOverAt = performance.now();
-  SFX.gameOver();
-  shake(9);
+  if (finish) {
+    SFX.finish();
+  } else {
+    SFX.gameOver();
+    shake(9);
+  }
   // seed replays and zen practice do not touch the records
   if ((game.mode === 'free' || game.mode === 'daily') && game.score > game.best) {
     game.best = game.score;
@@ -630,6 +764,19 @@ function gameOver() {
     game.newBest = true;
     lsSet('flapstack.daily.' + dailyDateStr(), String(game.score));
   }
+  // sprint records the finish time (only completed races count); attack
+  // records the score whether the timer ran out or the hearts did
+  if (game.mode === 'sprint' && finish &&
+      (game.sprintBest === 0 || game.playTime < game.sprintBest)) {
+    game.sprintBest = game.playTime;
+    game.newBest = true;
+    lsSet('flapstack.sprint', String(game.playTime));
+  }
+  if (game.mode === 'attack' && game.score > game.attackBest) {
+    game.attackBest = game.score;
+    game.newBest = true;
+    lsSet('flapstack.attack', String(game.score));
+  }
   life.games += 1;
   life.lines += game.lines;
   life.allClears += game.stats.allClears;
@@ -637,6 +784,11 @@ function gameOver() {
   saveLife();
   if (game.mode === 'daily') bumpStreak();
   pushHistory();
+  award('first-flight');
+  if (game.score >= 1000) award('grand');
+  if (game.playTime >= 300) award('five-min');
+  // any finished run retires the first-run hints for good
+  if (game.tut) { lsSet('flapstack.tut', '1'); game.tut = null; }
 }
 
 // Losing a life forfeits the current piece and launches a fresh flight; the
@@ -664,7 +816,21 @@ function flap() {
     game.piece.vy = CONFIG.FLAP_VY;
     game.flapAt = performance.now();
     SFX.flap();
+    if (game.tut && game.tut.step === 0 && ++game.tut.flaps >= 3) {
+      game.tut.step = 1;
+      game.tut.at = performance.now();
+    }
   }
+}
+
+// Dive: the downward counterpart to flap, for dropping into a narrow slot
+// deliberately. Sets the fall speed rather than adding to it, and never
+// slows a fall already faster than the dive.
+function dive() {
+  if (game.state !== 'FLYING' || !game.piece || game.settle) return;
+  game.piece.vy = Math.max(game.piece.vy, CONFIG.DIVE_VY);
+  game.diveAt = performance.now();
+  SFX.dive();
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +1102,10 @@ function lockPiece(viaSettle) {
   game.lockEvents.push({ cells: cells.map(c => ({ c: c.c, r: c.r })), supported });
   game.score += CONFIG.LOCK_SCORE;
   game.stats.pieces += 1;
+  if (game.tut && game.tut.step <= 1) {
+    game.tut.step = 2;
+    game.tut.at = performance.now();
+  }
   if (!viaSettle) {
     game.score += CONFIG.PRECISION_BONUS;
     const px = WELL_X + (cells.reduce((a, c) => a + c.c, 0) / cells.length + 0.5) * CELL;
@@ -965,9 +1135,12 @@ function lockPiece(viaSettle) {
     game.combo += 1;
     const mult = Math.min(CONFIG.COMBO_MAX_MULT, 1 + CONFIG.COMBO_STEP * (game.combo - 1));
     if (mult > game.stats.bestCombo) game.stats.bestCombo = mult;
+    if (mult >= CONFIG.COMBO_MAX_MULT) award('combo-max');
     const points = Math.round(CONFIG.LINE_SCORES[n] * mult);
     game.score += points;
     game.lines += fullRows.length;
+    award('first-clear');
+    if (n === 4) award('quad');
     game.flashRows = fullRows.slice();
     game.flashAt = performance.now();
     shake(2 + n * 1.5);
@@ -975,6 +1148,14 @@ function lockPiece(viaSettle) {
     const fx = WELL_X + WELL_W / 2;
     const fy = WELL_Y + fullRows[0] * CELL + CELL / 2;
     addFloater(fx, fy, mult > 1 ? '+' + points + ' x' + mult.toFixed(1) : '+' + points);
+    // every LEVEL_LINES cleared lines steps the level up: fanfare, floater,
+    // and a fresh backdrop wash from the piece palette
+    const newLevel = 1 + Math.floor(game.lines / CONFIG.LEVEL_LINES);
+    if (newLevel > game.level) {
+      game.level = newLevel;
+      addFloater(fx, fy - 48, 'LEVEL ' + newLevel);
+      SFX.level();
+    }
     // every completed row restores a heart, up to the maximum
     const gained = Math.min(CONFIG.LIVES_MAX, game.lives + fullRows.length) - game.lives;
     if (gained > 0) {
@@ -982,6 +1163,7 @@ function lockPiece(viaSettle) {
       addFloater(fx, fy + 26, gained === 1 ? '+1 LIFE' : '+' + gained + ' LIVES');
       SFX.heart();
     }
+    if (game.lives >= CONFIG.LIVES_MAX) award('hearts-full');
     // emptying the well entirely earns a flat bonus on top
     if (game.grid.every(row => row.every(x => x === null))) {
       game.score += CONFIG.ALL_CLEAR_BONUS;
@@ -989,10 +1171,18 @@ function lockPiece(viaSettle) {
       addFloater(fx, fy - 26, 'ALL CLEAR +' + CONFIG.ALL_CLEAR_BONUS);
       shake(8);
       SFX.allClear();
+      award('all-clear');
     }
   } else {
     game.combo = 0;
     SFX.lock();
+  }
+  if (game.score >= 1000) award('grand');
+
+  // sprint: the race ends the moment the target is reached
+  if (game.mode === 'sprint' && game.lines >= CONFIG.SPRINT_LINES) {
+    gameOver('FINISH!');
+    return;
   }
 
   // rising pressure: on a steady cadence a garbage row pushes the stack up
@@ -1038,9 +1228,29 @@ function lockPiece(viaSettle) {
 
 function step(dt) {
   game.playTime += dt;
+  if (game.playTime >= 300) award('five-min');
+  // time attack: the clock only burns while physics runs, so pausing pauses it
+  if (game.mode === 'attack') {
+    game.attackLeft -= dt;
+    const sec = Math.ceil(game.attackLeft);
+    if (sec !== game.lastAttackSec) {
+      game.lastAttackSec = sec;
+      if (sec <= 10 && sec > 0) SFX.rotate();
+    }
+    if (game.attackLeft <= 0) {
+      game.attackLeft = 0;
+      gameOver('TIME UP!');
+      return;
+    }
+  }
   if (game.settle) { stepSettle(dt); return; }
   const p = game.piece;
   const prev = blocksOf(p);
+  // first-run hint 1 also retires once the piece is nearing the obstacle
+  if (game.tut && game.tut.step === 0 && p.ox > 240) {
+    game.tut.step = 1;
+    game.tut.at = performance.now();
+  }
 
   // obstacle drift: at high difficulty the gaps slide up and down together
   for (const o of game.obstacles) {
@@ -1080,6 +1290,10 @@ function step(dt) {
     cur = blocksOf(p);
   }
 
+  // motion trail sample (render decides whether the speed warrants drawing)
+  game.trail.push(cur.map(b => ({ x: b.x, y: b.y })));
+  if (game.trail.length > 10) game.trail.shift();
+
   // 1. obstacle collision
   if (hitsObstacle(cur)) { loseLife(); return; }
 
@@ -1107,6 +1321,7 @@ function step(dt) {
     game.score += pts;
     game.passed = true;
     game.stats.passes += 1;
+    if (clean && ++game.stats.cleans >= 5) award('clean-five');
     addFloater(cur[0].x + CELL / 2, cur[0].y - 10, clean ? '+' + pts + ' CLEAN' : '+' + pts);
     SFX.pass(clean);
   }
@@ -1459,8 +1674,16 @@ function drawPiece() {
       }));
     }
   }
+  // flap squashes, dive stretches; whichever pulse is fresher wins
   let sx = 1, sy = 1;
-  if (game.flapAt) {
+  if (game.diveAt > game.flapAt) {
+    const t = (performance.now() - game.diveAt) / CONFIG.SQUASH_MS;
+    if (t < 1) {
+      const k = 1 - t;
+      sy = 1 + 0.14 * k;
+      sx = 1 - 0.10 * k;
+    }
+  } else if (game.flapAt) {
     const t = (performance.now() - game.flapAt) / CONFIG.SQUASH_MS;
     if (t < 1) {
       const k = 1 - t;
@@ -1486,9 +1709,12 @@ function drawHUD() {
   ctx.textBaseline = 'top';
   ctx.font = 'bold 22px ' + MONO;
   ctx.fillText('SCORE ' + game.score, 24, 22);
-  ctx.fillText('LINES ' + game.lines, 24, 50);
+  ctx.fillText('LINES ' + game.lines + '  LV ' + game.level, 24, 50);
   ctx.font = 'bold 16px ' + MONO;
-  const bestShown = game.mode === 'daily' ? game.dailyBest : game.best;
+  const bestShown = game.mode === 'daily' ? game.dailyBest
+    : game.mode === 'sprint' ? (game.sprintBest > 0 ? fmtClock(game.sprintBest) : '--')
+    : game.mode === 'attack' ? game.attackBest
+    : game.best;
   if (game.bestBeaten) ctx.fillStyle = CONFIG.HEART;
   ctx.fillText('BEST ' + bestShown, 24, 82);
   ctx.fillStyle = CONFIG.INK;
@@ -1497,6 +1723,25 @@ function drawHUD() {
   if (game.mode === 'daily') { ctx.fillText('DAILY ' + dailyDateStr(), 24, tagY); tagY += 16; }
   else if (game.mode === 'seed') { ctx.fillText('SEED ' + game.lastSeed, 24, tagY); tagY += 16; }
   else if (game.mode === 'zen') { ctx.fillText('ZEN PRACTICE', 24, tagY); tagY += 16; }
+  else if (game.mode === 'sprint') {
+    ctx.fillText('SPRINT ' + Math.min(game.lines, CONFIG.SPRINT_LINES) + '/' + CONFIG.SPRINT_LINES +
+                 '   ' + fmtClock(game.playTime), 24, tagY);
+    tagY += 16;
+  }
+
+  // time attack: the countdown rules the run, so it reads large and central,
+  // pulsing red through the final ten seconds
+  if (game.mode === 'attack') {
+    ctx.save();
+    const low = game.attackLeft <= 10;
+    ctx.fillStyle = low ? CONFIG.HEART : CONFIG.INK;
+    if (low) ctx.globalAlpha = 0.72 + 0.28 * Math.sin(performance.now() * 0.012);
+    ctx.font = 'bold 30px ' + MONO;
+    ctx.textAlign = 'center';
+    ctx.fillText(fmtClock(Math.ceil(game.attackLeft)), 300, 20);
+    ctx.restore();
+    ctx.textAlign = 'left';
+  }
   if (game.combo >= 2) {
     const mult = Math.min(CONFIG.COMBO_MAX_MULT, 1 + CONFIG.COMBO_STEP * (game.combo - 1));
     ctx.fillStyle = CONFIG.HEART;
@@ -1608,43 +1853,221 @@ function drawTitleDrift() {
   ctx.restore();
 }
 
+// faint parallax backdrop in the flight zone: distant dots and haze bands
+// scrolling slower than the action. Pure ambience, static under reduced motion.
+const backdrop = { stars: [], clouds: [], scroll: 0, lastT: 0 };
+function drawBackdrop() {
+  if (backdrop.stars.length === 0) {
+    for (let i = 0; i < 40; i++) {
+      backdrop.stars.push({
+        x: Math.random() * WELL_X, y: Math.random() * CONFIG.LOGICAL_H,
+        s: 1 + Math.random() * 1.6, f: 0.15 + Math.random() * 0.2,
+      });
+    }
+    for (let i = 0; i < 6; i++) {
+      backdrop.clouds.push({
+        x: Math.random() * WELL_X, y: 30 + Math.random() * (CONFIG.LOGICAL_H - 90),
+        w: 90 + Math.random() * 130, h: 14 + Math.random() * 18,
+        f: 0.4 + Math.random() * 0.25,
+      });
+    }
+  }
+  const now = performance.now();
+  const dt = backdrop.lastT ? Math.min(0.05, (now - backdrop.lastT) / 1000) : 0.016;
+  backdrop.lastT = now;
+  if (!REDUCED_MOTION && game.state === 'FLYING') backdrop.scroll += game.scrollSpeed * dt;
+  ctx.save();
+  ctx.fillStyle = CONFIG.INK;
+  ctx.globalAlpha = 0.10;
+  for (const st of backdrop.stars) {
+    const x = ((st.x - backdrop.scroll * st.f) % WELL_X + WELL_X) % WELL_X;
+    ctx.fillRect(x, st.y, st.s, st.s);
+  }
+  ctx.globalAlpha = 0.045;
+  for (const cl of backdrop.clouds) {
+    const range = WELL_X + cl.w;
+    const x = ((cl.x - backdrop.scroll * cl.f) % range + range) % range - cl.w;
+    ctx.fillRect(x, cl.y, cl.w, cl.h);
+  }
+  ctx.restore();
+}
+
+// afterimages behind the piece once the scroll is fast enough to feel it
+function drawTrail() {
+  if (REDUCED_MOTION || game.settle || !game.piece) return;
+  if (game.scrollSpeed < CONFIG.TRAIL_MIN_SPEED || game.trail.length === 0) return;
+  ctx.save();
+  ctx.fillStyle = SHAPES[game.piece.shapeIndex].color;
+  for (let k = 1; k <= 3; k++) {
+    const ix = game.trail.length - 1 - k * 3;
+    if (ix < 0) break;
+    ctx.globalAlpha = 0.10 - k * 0.025;
+    for (const b of game.trail[ix]) ctx.fillRect(b.x, b.y, CELL, CELL);
+  }
+  ctx.restore();
+}
+
+// first-run hints: three short prompts that follow the opening moments of the
+// very first flight, then never appear again
+function drawTutorial() {
+  if (!game.tut) return;
+  const now = performance.now();
+  if (game.tut.step === 2 && now - game.tut.at > 4000) {
+    lsSet('flapstack.tut', '1');
+    game.tut = null;
+    return;
+  }
+  ctx.save();
+  ctx.globalAlpha = 0.65 + 0.3 * Math.sin(now * 0.006);
+  ctx.fillStyle = CONFIG.INK;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 20px ' + MONO;
+  if (game.tut.step === 0) {
+    const p = game.piece;
+    // clamped right of the NEXT/HOLD column so the hint never sits on the HUD
+    const tx = Math.min(400, Math.max(280, (p ? p.ox : 40) + 130));
+    const ty = Math.max(46, (p ? p.oy : 260) - 56);
+    ctx.fillText('SPACE / CLICK TO STAY UP', tx, ty);
+  } else if (game.tut.step === 1) {
+    ctx.fillText('LAND IT IN THE WELL >>', WELL_X - 160, WELL_Y + 80);
+  } else {
+    ctx.fillText('FILL A ROW TO CLEAR IT', WELL_X - 160, WELL_Y + 80);
+  }
+  ctx.restore();
+}
+
+// top-center banners (badge unlocks): slide in, hold, fade
+function drawToasts() {
+  if (game.toasts.length === 0) return;
+  const now = performance.now();
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 15px ' + MONO;
+  let shown = 0;
+  game.toasts = game.toasts.filter(tb => {
+    const t = (now - tb.at) / 2600;
+    if (t >= 1) return false;
+    const slide = Math.min(1, t * 8);
+    const fade = t > 0.85 ? (1 - t) / 0.15 : 1;
+    const y = -20 + slide * (36 + shown * 32);
+    const w = tb.text.length * 9.5 + 36;
+    ctx.globalAlpha = 0.92 * fade;
+    ctx.fillStyle = 'rgba(20,25,34,0.95)';
+    ctx.fillRect(CONFIG.LOGICAL_W / 2 - w / 2, y - 14, w, 28);
+    ctx.strokeStyle = '#E8B84C';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(CONFIG.LOGICAL_W / 2 - w / 2, y - 14, w, 28);
+    ctx.fillStyle = CONFIG.INK;
+    ctx.fillText(tb.text, CONFIG.LOGICAL_W / 2, y + 1);
+    shown++;
+    return true;
+  });
+  ctx.restore();
+}
+
+// draw a clickable button and register its rect for the mousedown hit test.
+// Invisible buttons make plain text lines (history rows) clickable too.
+function uiButton(x, y, w, h, label, action, opts) {
+  opts = opts || {};
+  game.uiButtons.push({ x: x, y: y, w: w, h: h, action: action });
+  if (opts.invisible) return;
+  ctx.save();
+  ctx.fillStyle = opts.active ? 'rgba(237,232,220,0.18)' : 'rgba(237,232,220,0.06)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = CONFIG.INK;
+  ctx.globalAlpha = opts.active ? 1 : 0.45;
+  ctx.lineWidth = opts.active ? 2 : 1;
+  ctx.strokeRect(x, y, w, h);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = CONFIG.INK;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = (opts.font || 'bold 13px ') + MONO;
+  ctx.fillText(label, x + w / 2, y + h / 2 + 1);
+  ctx.restore();
+}
+
 function drawStartOverlay() {
   drawOverlayPanel();
   ctx.fillStyle = CONFIG.INK;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = 'bold 72px ' + MONO;
-  ctx.fillText('FLAPSTACK', CONFIG.LOGICAL_W / 2, 180);
-  ctx.font = '19px ' + MONO;
-  ctx.fillText('Space or Click: Flap      R or Up: Rotate      Shift or H: Hold', CONFIG.LOGICAL_W / 2, 262);
-  ctx.fillText('P: Pause    M: Sound    N: Music    C: Letters    D: Mode    Esc: End run', CONFIG.LOGICAL_W / 2, 294);
-  ctx.font = 'bold 19px ' + MONO;
-  const modeText = game.mode === 'daily'
-    ? 'Mode: DAILY ' + dailyDateStr() + '   best ' + game.dailyBest +
-      (streakN > 0 ? '   streak ' + streakN : '')
-    : game.mode === 'seed' ? 'Mode: SEED ' + game.customSeed
-    : game.mode === 'zen' ? 'Mode: ZEN PRACTICE (no pipes, no game over)'
-    : 'Mode: FREE PLAY';
-  ctx.fillText(modeText + '   (D to switch)', CONFIG.LOGICAL_W / 2, 344);
-  ctx.font = 'bold 22px ' + MONO;
-  ctx.fillText('Press Space to start', CONFIG.LOGICAL_W / 2, 396);
+  ctx.font = 'bold 66px ' + MONO;
+  ctx.fillText('FLAPSTACK', CONFIG.LOGICAL_W / 2, 138);
+  ctx.font = '17px ' + MONO;
+  ctx.fillText('Space or Click: Flap    R or Up: Rotate    Down: Dive    Shift or H: Hold',
+               CONFIG.LOGICAL_W / 2, 208);
+
+  // mode select: clickable, and D cycles through the same list
+  const list = modeList();
+  const MW = 104, MH = 34, MG = 10;
+  let mx = (CONFIG.LOGICAL_W - (list.length * MW + (list.length - 1) * MG)) / 2;
+  for (const m of list) {
+    uiButton(mx, 244, MW, MH, m.toUpperCase(), setMode.bind(null, m), { active: game.mode === m });
+    mx += MW + MG;
+  }
+  ctx.fillStyle = CONFIG.INK;
+  ctx.font = '15px ' + MONO;
+  const info = game.mode === 'daily'
+      ? 'Same run for everyone on ' + dailyDateStr() + '.   Best ' + game.dailyBest +
+        (streakN > 0 ? '   Streak ' + streakN : '')
+    : game.mode === 'seed' ? 'Replaying seed ' + game.customSeed
+    : game.mode === 'zen' ? 'No pipes, no game over. Pure stacking practice.'
+    : game.mode === 'sprint' ? 'Race to ' + CONFIG.SPRINT_LINES + ' lines.   Best ' +
+        (game.sprintBest > 0 ? fmtClock(game.sprintBest) : '--')
+    : game.mode === 'attack' ? 'Best score in ' + fmtClock(CONFIG.ATTACK_TIME) + '.   Best ' + game.attackBest
+    : 'Endless flight, ramping difficulty.   Best ' + game.best;
+  ctx.fillText(info, CONFIG.LOGICAL_W / 2, 302);
+
+  ctx.font = 'bold 21px ' + MONO;
+  ctx.fillText('Press Space to start', CONFIG.LOGICAL_W / 2, 344);
+
+  const btns = [
+    ['SOUND ' + (audio.muted ? 'OFF' : 'ON'), toggleMute],
+    ['MUSIC ' + (music.on ? 'ON' : 'OFF'), toggleMusic],
+    ['VOL ' + Math.round(audio.vol * 100) + '%', () => setVolume(audio.vol >= 1 ? 0.2 : audio.vol + 0.2)],
+    ['BADGES ' + Object.keys(badges).length + '/' + BADGES.length,
+      () => { game.badgesOpen = !game.badgesOpen; }],
+    ['HELP ?', () => { game.helpOpen = !game.helpOpen; }],
+  ];
+  const BW = 118, BH = 26;
+  let bx = (CONFIG.LOGICAL_W - (btns.length * BW + (btns.length - 1) * 8)) / 2;
+  for (const b of btns) {
+    uiButton(bx, 380, BW, BH, b[0], b[1], { font: 'bold 12px ' });
+    bx += BW + 8;
+  }
+
+  ctx.fillStyle = CONFIG.INK;
   if (life.games > 0) {
-    ctx.font = '15px ' + MONO;
-    const clock = fmtClock(life.bestTime);
+    ctx.font = '14px ' + MONO;
     ctx.fillText('Lifetime   games ' + life.games + '   lines ' + life.lines +
-                 '   all clears ' + life.allClears + '   longest ' + clock,
-                 CONFIG.LOGICAL_W / 2, 440);
+                 '   all clears ' + life.allClears + '   longest ' + fmtClock(life.bestTime),
+                 CONFIG.LOGICAL_W / 2, 432);
   }
   if (runHistory.length > 0) {
     ctx.font = 'bold 12px ' + MONO;
-    ctx.fillText('Recent runs  (1-' + runHistory.length + ' to replay)', CONFIG.LOGICAL_W / 2, 464);
+    ctx.fillText('Recent runs  (click or 1-' + runHistory.length + ' to replay)',
+                 CONFIG.LOGICAL_W / 2, 458);
     ctx.font = '12px ' + MONO;
     for (let i = 0; i < runHistory.length; i++) {
       const h = runHistory[i];
+      const y = 476 + i * 13;
       ctx.fillText((i + 1) + ')  ' + h.score + ' pts   ' + h.lines + ' lines   ' +
-                   h.mode + '   seed ' + h.seed, CONFIG.LOGICAL_W / 2, 482 + i * 12);
+                   h.mode + '   seed ' + h.seed, CONFIG.LOGICAL_W / 2, y);
+      uiButton(CONFIG.LOGICAL_W / 2 - 230, y - 6, 460, 13, '', replayHistory.bind(null, i),
+               { invisible: true });
     }
   }
+
+  // build stamp, small and out of the way
+  ctx.globalAlpha = 0.4;
+  ctx.font = '11px ' + MONO;
+  ctx.textAlign = 'right';
+  ctx.fillText(VERSION, CONFIG.LOGICAL_W - 10, CONFIG.LOGICAL_H - 12);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
 }
 
 function drawGameOverOverlay() {
@@ -1652,34 +2075,144 @@ function drawGameOverOverlay() {
   ctx.fillStyle = CONFIG.INK;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = 'bold 64px ' + MONO;
-  ctx.fillText('GAME OVER', CONFIG.LOGICAL_W / 2, 170);
+  ctx.font = 'bold 62px ' + MONO;
+  ctx.fillText(game.finish || 'GAME OVER', CONFIG.LOGICAL_W / 2, 160);
   ctx.font = '24px ' + MONO;
-  ctx.fillText('Score ' + game.score + '     Lines ' + game.lines, CONFIG.LOGICAL_W / 2, 246);
+  if (game.mode === 'sprint' && game.finish) {
+    ctx.fillText('Time ' + fmtClock(game.playTime) + '     Score ' + game.score,
+                 CONFIG.LOGICAL_W / 2, 236);
+  } else {
+    ctx.fillText('Score ' + game.score + '     Lines ' + game.lines, CONFIG.LOGICAL_W / 2, 236);
+  }
   ctx.font = 'bold 20px ' + MONO;
-  const bestShown = game.mode === 'daily' ? game.dailyBest : game.best;
-  const bestLabel = game.mode === 'daily' ? 'DAILY BEST ' : 'BEST ';
+  const bestLabel = game.mode === 'daily' ? 'DAILY BEST '
+    : game.mode === 'sprint' ? 'BEST TIME '
+    : game.mode === 'attack' ? 'ATTACK BEST '
+    : 'BEST ';
+  const bestShown = game.mode === 'daily' ? game.dailyBest
+    : game.mode === 'sprint' ? (game.sprintBest > 0 ? fmtClock(game.sprintBest) : '--')
+    : game.mode === 'attack' ? game.attackBest
+    : game.best;
   if (game.newBest) {
     ctx.fillStyle = CONFIG.HEART;
-    ctx.fillText('NEW ' + bestLabel + bestShown + '!', CONFIG.LOGICAL_W / 2, 290);
+    ctx.fillText('NEW ' + bestLabel + bestShown + '!', CONFIG.LOGICAL_W / 2, 280);
     ctx.fillStyle = CONFIG.INK;
   } else {
-    ctx.fillText(bestLabel + bestShown, CONFIG.LOGICAL_W / 2, 290);
+    ctx.fillText(bestLabel + bestShown, CONFIG.LOGICAL_W / 2, 280);
   }
-  const clock = fmtClock(game.playTime);
   ctx.font = '17px ' + MONO;
   ctx.fillText('Pieces ' + game.stats.pieces + '     Passes ' + game.stats.passes +
-               '     Best combo x' + game.stats.bestCombo.toFixed(1) + '     Time ' + clock,
-               CONFIG.LOGICAL_W / 2, 334);
+               '     Best combo x' + game.stats.bestCombo.toFixed(1) + '     Time ' + fmtClock(game.playTime),
+               CONFIG.LOGICAL_W / 2, 322);
   ctx.font = 'bold 22px ' + MONO;
-  ctx.fillText('Press Space to restart', CONFIG.LOGICAL_W / 2, 392);
-  ctx.font = '16px ' + MONO;
-  ctx.fillText('D: switch mode      S: copy result', CONFIG.LOGICAL_W / 2, 428);
+  ctx.fillText('Press Space to restart', CONFIG.LOGICAL_W / 2, 368);
+  const btns = [
+    ['RETRY', () => {
+      if (performance.now() - game.gameOverAt >= CONFIG.GAMEOVER_LOCKOUT) startRun();
+    }],
+    ['TITLE', () => { game.state = 'START'; }],
+    ['COPY RESULT', copyResult],
+    ['HELP ?', () => { game.helpOpen = !game.helpOpen; }],
+  ];
+  const BW = 124, BH = 28;
+  let bx = (CONFIG.LOGICAL_W - (btns.length * BW + (btns.length - 1) * 10)) / 2;
+  for (const b of btns) {
+    uiButton(bx, 402, BW, BH, b[0], b[1], { font: 'bold 12px ' });
+    bx += BW + 10;
+  }
+  ctx.fillStyle = CONFIG.INK;
   if (game.mode !== 'daily') {
     ctx.font = '14px ' + MONO;
     ctx.fillText('Seed ' + game.lastSeed + '   (open with #seed=' + game.lastSeed + ' to replay)',
-                 CONFIG.LOGICAL_W / 2, 462);
+                 CONFIG.LOGICAL_W / 2, 460);
   }
+}
+
+// full key map plus a two-line how-to, over everything (? toggles)
+const KEY_HELP = [
+  ['SPACE / CLICK', 'Flap'],
+  ['R or UP', 'Rotate piece'],
+  ['DOWN', 'Dive'],
+  ['SHIFT or H', 'Hold / swap piece'],
+  ['P', 'Pause, resume'],
+  ['ESC', 'End run / close panel'],
+  ['D', 'Switch mode (between runs)'],
+  ['1-5', 'Replay a recent run'],
+  ['M', 'Sound on / off'],
+  ['N', 'Music on / off'],
+  ['- and =', 'Volume down / up'],
+  ['C', 'Letter overlay on blocks'],
+  ['S', 'Copy result (game over)'],
+  ['B', 'Badge gallery (between runs)'],
+  ['T', 'Tuning panel (dev)'],
+  ['?', 'This help'],
+];
+
+function drawHelpOverlay() {
+  drawOverlayPanel();
+  ctx.save();
+  ctx.fillStyle = CONFIG.INK;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 30px ' + MONO;
+  ctx.fillText('CONTROLS', CONFIG.LOGICAL_W / 2, 54);
+  ctx.font = '14px ' + MONO;
+  ctx.fillText('Flap through the pipes, then land the piece in the well.', CONFIG.LOGICAL_W / 2, 90);
+  ctx.fillText('Full rows clear and win hearts back. Blocks in the top two rows end the run.',
+               CONFIG.LOGICAL_W / 2, 110);
+  const rows = Math.ceil(KEY_HELP.length / 2);
+  ctx.textAlign = 'left';
+  for (let i = 0; i < KEY_HELP.length; i++) {
+    const col = Math.floor(i / rows);
+    const x = col === 0 ? 110 : 520;
+    const y = 152 + (i % rows) * 30;
+    ctx.font = 'bold 14px ' + MONO;
+    ctx.fillText(KEY_HELP[i][0], x, y);
+    ctx.font = '14px ' + MONO;
+    ctx.globalAlpha = 0.85;
+    ctx.fillText(KEY_HELP[i][1], x + 152, y);
+    ctx.globalAlpha = 1;
+  }
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 15px ' + MONO;
+  ctx.fillText('? or Esc to close', CONFIG.LOGICAL_W / 2, 152 + rows * 30 + 20);
+  ctx.restore();
+}
+
+// badge gallery (B between runs): all feats, earned ones lit with their date
+function drawBadgesOverlay() {
+  drawOverlayPanel();
+  ctx.save();
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = CONFIG.INK;
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 30px ' + MONO;
+  ctx.fillText('BADGES  ' + Object.keys(badges).length + '/' + BADGES.length,
+               CONFIG.LOGICAL_W / 2, 54);
+  const rows = Math.ceil(BADGES.length / 2);
+  for (let i = 0; i < BADGES.length; i++) {
+    const b = BADGES[i];
+    const owned = !!badges[b[0]];
+    const x = Math.floor(i / rows) === 0 ? 70 : 510;
+    const y = 122 + (i % rows) * 68;
+    ctx.globalAlpha = owned ? 1 : 0.32;
+    ctx.fillStyle = owned ? '#E8B84C' : 'rgba(237,232,220,0.25)';
+    ctx.fillRect(x, y - 16, 32, 32);
+    ctx.strokeStyle = CONFIG.INK;
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x, y - 16, 32, 32);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = CONFIG.INK;
+    ctx.font = 'bold 15px ' + MONO;
+    ctx.fillText(b[1], x + 46, y - 10);
+    ctx.font = '13px ' + MONO;
+    ctx.fillText(b[2] + (owned ? '   (' + badges[b[0]] + ')' : ''), x + 46, y + 11);
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 15px ' + MONO;
+  ctx.fillText('B or Esc to close', CONFIG.LOGICAL_W / 2, 122 + rows * 68 + 6);
+  ctx.restore();
 }
 
 function drawPauseOverlay() {
@@ -1709,6 +2242,9 @@ function drawResumeOverlay() {
 }
 
 function render() {
+  // clickable rects are re-registered by whichever overlays draw this frame
+  game.uiButtons.length = 0;
+
   // letterbox: clear the whole backing store to black first
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#000';
@@ -1717,9 +2253,16 @@ function render() {
   // logical coordinate transform (dpr * fit-scale, letterbox offset)
   ctx.setTransform(view.s, 0, 0, view.s, view.tx, view.ty);
 
-  // playfield background
+  // playfield background, ambient parallax, then the level wash on top
   ctx.fillStyle = CONFIG.BG;
   ctx.fillRect(0, 0, CONFIG.LOGICAL_W, CONFIG.LOGICAL_H);
+  drawBackdrop();
+  if (game.state !== 'START' && game.level > 1) {
+    ctx.globalAlpha = 0.05;
+    ctx.fillStyle = LEVEL_TINTS[(game.level - 2) % LEVEL_TINTS.length];
+    ctx.fillRect(0, 0, CONFIG.LOGICAL_W, CONFIG.LOGICAL_H);
+    ctx.globalAlpha = 1;
+  }
 
   // screen shake nudges everything drawn after the background
   const sht = (performance.now() - game.shakeAt) / CONFIG.SHAKE_MS;
@@ -1739,25 +2282,37 @@ function render() {
   drawClearFlash();
   if (game.state === 'FLYING' || game.state === 'PAUSED' || game.state === 'RESUMING') drawGhost();
   if (game.state !== 'START') {
+    if (game.state === 'FLYING') drawTrail();
     drawPiece();
     drawHUD();
+    if (game.state === 'FLYING') drawTutorial();
     drawFloaters();
     drawParticles();
     drawHitFlash();
   }
-  if (game.state === 'START') drawStartOverlay();
-  else if (game.state === 'PAUSED') drawPauseOverlay();
-  else if (game.state === 'RESUMING') drawResumeOverlay();
-  else if (game.state === 'GAMEOVER') {
-    // death beat: hold on the crash for a moment, then fade the overlay in
-    const t = performance.now() - game.gameOverAt;
-    if (t > CONFIG.DEATH_BEAT_MS) {
-      ctx.save();
-      ctx.globalAlpha = Math.min(1, (t - CONFIG.DEATH_BEAT_MS) / 150);
-      drawGameOverOverlay();
-      ctx.restore();
+  // help and badge panels replace the state overlay under them entirely, so
+  // no text bleeds through and no hidden buttons stay registered
+  const panelUp = game.helpOpen || game.badgesOpen;
+  if (!panelUp) {
+    if (game.state === 'START') drawStartOverlay();
+    else if (game.state === 'PAUSED') drawPauseOverlay();
+    else if (game.state === 'RESUMING') drawResumeOverlay();
+    else if (game.state === 'GAMEOVER') {
+      // death beat: hold on the crash for a moment, then fade the overlay in.
+      // A victory finish has no crash to linger on, so it skips the hold.
+      const beat = game.finish ? 0 : CONFIG.DEATH_BEAT_MS;
+      const t = performance.now() - game.gameOverAt;
+      if (t > beat) {
+        ctx.save();
+        ctx.globalAlpha = Math.min(1, (t - beat) / 150);
+        drawGameOverOverlay();
+        ctx.restore();
+      }
     }
   }
+  drawToasts();
+  if (game.helpOpen) drawHelpOverlay();
+  else if (game.badgesOpen) drawBadgesOverlay();
 }
 
 // ---------------------------------------------------------------------------
@@ -1828,6 +2383,7 @@ function primaryAction() {
 const TUNE_FIELDS = [
   ['GRAVITY', 200, 1600, 10],
   ['FLAP_VY', -520, -140, 5],
+  ['DIVE_VY', 100, 600, 10],
   ['TERMINAL_VY', 200, 900, 10],
   ['SCROLL_START', 40, 260, 5],
   ['SCROLL_MAX', 100, 400, 5],
@@ -1924,12 +2480,37 @@ window.addEventListener('keydown', (e) => {
   // let the tuning panel's controls keep their own keyboard behavior
   if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' ||
                    e.target.tagName === 'TEXTAREA')) return;
+  // an open help or badge panel swallows the keyboard until it is closed
+  if (game.helpOpen || game.badgesOpen) {
+    if (e.code === 'Space' || e.key === 'Escape' || e.code === 'Slash' ||
+        e.key === 'b' || e.key === 'B') {
+      e.preventDefault();
+      game.helpOpen = false;
+      game.badgesOpen = false;
+    }
+    return;
+  }
   if (e.code === 'Space') {
     e.preventDefault();
     primaryAction();
   } else if (e.key === 'r' || e.key === 'R' || e.code === 'ArrowUp') {
     e.preventDefault();
     tryRotate();
+  } else if (e.code === 'ArrowDown') {
+    e.preventDefault();
+    dive();
+  } else if (e.code === 'Slash') {
+    // help from anywhere; opening it mid-flight parks the run in pause
+    e.preventDefault();
+    if (game.state === 'FLYING') game.state = 'PAUSED';
+    game.helpOpen = true;
+  } else if (e.key === 'b' || e.key === 'B') {
+    e.preventDefault();
+    if (game.state === 'START' || game.state === 'GAMEOVER') game.badgesOpen = true;
+  } else if (e.code === 'Minus' || e.code === 'Equal') {
+    e.preventDefault();
+    setVolume(audio.vol + (e.code === 'Minus' ? -0.1 : 0.1));
+    addFloater(CONFIG.LOGICAL_W / 2, 130, 'VOL ' + Math.round(audio.vol * 100) + '%');
   } else if (e.key === 'p' || e.key === 'P' || e.code === 'KeyP') {
     e.preventDefault();
     if (game.state === 'FLYING') {
@@ -1966,14 +2547,7 @@ window.addEventListener('keydown', (e) => {
     toggleTunePanel();
   } else if (e.key >= '1' && e.key <= '5') {
     e.preventDefault();
-    if (game.state === 'START' || game.state === 'GAMEOVER') {
-      const h = runHistory[e.key.charCodeAt(0) - 49];
-      if (h) {
-        game.customSeed = h.seed >>> 0;
-        game.mode = h.mode === 'zen' ? 'zen' : 'seed';
-        startRun();
-      }
-    }
+    replayHistory(e.key.charCodeAt(0) - 49);
   } else if (e.key === 'Escape') {
     e.preventDefault();
     if (game.state === 'FLYING' || game.state === 'PAUSED' || game.state === 'RESUMING') gameOver();
@@ -1986,9 +2560,32 @@ window.addEventListener('blur', () => {
   if (game.state === 'FLYING' || game.state === 'RESUMING') game.state = 'PAUSED';
 });
 
+// map a mouse event to logical game coordinates through the letterbox
+function eventPoint(e) {
+  const rect = canvas.getBoundingClientRect();
+  const bs = canvas.width / rect.width; // css px -> backing px
+  return {
+    x: ((e.clientX - rect.left) * bs - view.tx) / view.s,
+    y: ((e.clientY - rect.top) * bs - view.ty) / view.s,
+  };
+}
+
 canvas.addEventListener('mousedown', (e) => {
   e.preventDefault();
   canvas.focus();
+  // an open panel closes on any click, and never leaks one to the buttons
+  if (game.helpOpen || game.badgesOpen) {
+    game.helpOpen = false;
+    game.badgesOpen = false;
+    return;
+  }
+  const pt = eventPoint(e);
+  for (const b of game.uiButtons) {
+    if (pt.x >= b.x && pt.x <= b.x + b.w && pt.y >= b.y && pt.y <= b.y + b.h) {
+      b.action();
+      return;
+    }
+  }
   primaryAction();
 });
 
@@ -2028,10 +2625,24 @@ window.__game = {
   get lastSeed() { return game.lastSeed; },
   get cbMode() { return game.cbMode; },
   get life() { return life; },
+  get level() { return game.level; },
+  get volume() { return audio.vol; },
+  get badges() { return badges; },
+  get helpOpen() { return game.helpOpen; },
+  get badgesOpen() { return game.badgesOpen; },
+  get attackLeft() { return game.attackLeft; },
+  get finish() { return game.finish; },
+  get sprintBest() { return game.sprintBest; },
+  get attackBest() { return game.attackBest; },
+  get tutStep() { return game.tut ? game.tut.step : null; },
+  get trailLength() { return game.trail.length; },
   holdSwap: tryHold,
   toggleMode: toggleMode,
+  setMode: setMode,
   toggleMute: toggleMute,
   toggleMusic: toggleMusic,
+  setVolume: setVolume,
+  dive: dive,
   _setBest(v) { game.best = v; },
   get config() { return CONFIG; },
   flap: flap,
@@ -2413,11 +3024,141 @@ function runTestSuite() {
     toMode('free');
   });
 
+  T('dive sets fall speed, never slows a faster fall', () => {
+    G.start(); clearWell();
+    G.setPiece(1, 0, 150, 250, 0);
+    G.dive();
+    ok(G.piece.vy === CONFIG.DIVE_VY, 'vy ' + G.piece.vy);
+    G.setPiece(1, 0, 150, 250, 550);
+    G.dive();
+    ok(G.piece.vy === 550, 'dive slowed a faster fall');
+  });
+
+  T('volume clamps to 0..1 and persists', () => {
+    G.setVolume(2);
+    ok(G.volume === 1, 'high clamp ' + G.volume);
+    G.setVolume(-0.4);
+    ok(G.volume === 0, 'low clamp ' + G.volume);
+    G.setVolume(0.7);
+    ok(G.volume === 0.7 && lsGet('flapstack.vol') === '0.7', 'persist failed');
+  });
+
+  T('level steps at every tenth line', () => {
+    toMode('free');
+    G.start();
+    ok(G.level === 1, 'boot level ' + G.level);
+    game.lines = 9;
+    clearingLock(5);
+    ok(G.lines === 10 && G.level === 2, G.lines + ' lines, level ' + G.level);
+  });
+
+  T('sprint: reaching the target finishes and records', () => {
+    toMode('sprint');
+    game.sprintBest = 0;
+    try { localStorage.removeItem('flapstack.sprint'); } catch (e) {}
+    G.start();
+    ok(G.attackLeft === 0, 'attack timer armed in sprint');
+    game.lines = CONFIG.SPRINT_LINES - 1;
+    clearingLock(5);
+    ok(G.state === 'GAMEOVER' && G.finish === 'FINISH!', G.state + '/' + G.finish);
+    ok(G.sprintBest > 0 && lsGet('flapstack.sprint') === String(G.sprintBest), 'record missing');
+    toMode('free');
+  });
+
+  T('attack: timer ends the run and records the score', () => {
+    toMode('attack');
+    game.attackBest = 0;
+    try { localStorage.removeItem('flapstack.attack'); } catch (e) {}
+    G.start();
+    ok(Math.abs(G.attackLeft - CONFIG.ATTACK_TIME) < 0.001, 'timer not armed');
+    clearingLock(5);
+    ok(G.state === 'FLYING', 'died during setup');
+    game.attackLeft = 0.01; // less than one step of clock left
+    G.step(DT);
+    ok(G.state === 'GAMEOVER' && G.finish === 'TIME UP!', G.state + '/' + G.finish);
+    ok(G.attackBest === G.score && lsGet('flapstack.attack') === String(G.score), 'record missing');
+    toMode('free');
+  });
+
+  T('mode cycle covers every mode and wraps', () => {
+    press('Escape', 'Escape');
+    toMode('free');
+    const seen = [];
+    const total = modeList().length;
+    for (let i = 0; i < total; i++) { G.toggleMode(); seen.push(G.mode); }
+    ok(seen.indexOf('daily') >= 0 && seen.indexOf('zen') >= 0 &&
+       seen.indexOf('sprint') >= 0 && seen.indexOf('attack') >= 0, seen.join(','));
+    ok(seen[seen.length - 1] === 'free', 'no wrap: ' + seen.join(','));
+  });
+
+  T('badges: earn once, persist, zen never awards', () => {
+    const savedBadges = JSON.stringify(badges);
+    badges = {};
+    lsSet('flapstack.badges', '{}');
+    toMode('zen');
+    G.start();
+    award('quad');
+    ok(!badges['quad'], 'zen awarded a badge');
+    press('Escape', 'Escape');
+    toMode('free');
+    G.start();
+    game.toasts.length = 0; // earlier awards may have filled the toast cap
+    award('quad');
+    ok(!!badges['quad'], 'award failed');
+    ok(game.toasts.length === 1, 'no unlock toast');
+    award('quad');
+    ok(game.toasts.length === 1, 'double award');
+    ok(!!JSON.parse(lsGet('flapstack.badges'))['quad'], 'not persisted');
+    press('Escape', 'Escape');
+    badges = JSON.parse(savedBadges);
+  });
+
+  T('help overlay parks a flight in pause', () => {
+    toMode('free');
+    G.start();
+    press('Slash', '?');
+    ok(G.helpOpen === true && G.state === 'PAUSED', G.state + ' open=' + G.helpOpen);
+    press('Escape', 'Escape');
+    ok(G.helpOpen === false && G.state === 'PAUSED', 'esc hit the run, not the panel');
+    press('Escape', 'Escape');
+    ok(G.state === 'GAMEOVER', 'second esc should end the run');
+  });
+
+  T('first-run hints advance and retire for good', () => {
+    const g0 = life.games;
+    life.games = 0;
+    try { localStorage.removeItem('flapstack.tut'); } catch (e) {}
+    toMode('free');
+    G.start();
+    ok(G.tutStep === 0, 'hints did not arm');
+    G.flap(); G.flap(); G.flap();
+    ok(G.tutStep === 1, 'flaps did not advance hints');
+    clearWell();
+    G.setPiece(1, 0, W.x + 2 * W.cell, W.b - 2 * W.cell - 3, 200);
+    runTo(40);
+    ok(G.tutStep === 2, 'lock did not advance hints');
+    press('Escape', 'Escape');
+    ok(lsGet('flapstack.tut') === '1' && G.tutStep === null, 'hints not retired');
+    life.games = g0;
+  });
+
+  T('trail samples per flight, cleared on lock', () => {
+    toMode('free');
+    G.start();
+    for (let s = 0; s < 8; s++) G.step(DT);
+    ok(G.trailLength > 0, 'no samples collected');
+    clearWell();
+    G.setPiece(1, 0, W.x + 2 * W.cell, W.b - 2 * W.cell - 3, 200);
+    runTo(40);
+    ok(G.trailLength === 0, 'not cleared: ' + G.trailLength);
+  });
+
   T('stability: 1200 random steps, all locks supported', () => {
     G.start();
     for (let s = 0; s < 1200; s++) {
       if (G.state === 'GAMEOVER') G.start();
       if (s % 17 === 0) G.flap();
+      if (s % 29 === 0) G.dive();
       if (s % 53 === 0) G.rotate();
       if (s % 71 === 0) G.holdSwap();
       G.step(DT);
@@ -2446,6 +3187,31 @@ function runTestSuite() {
     for (const k in savedStorage) localStorage.setItem(k, savedStorage[k]);
   } catch (e) {}
   for (const k in savedConfig) CONFIG[k] = savedConfig[k];
+  // and the in-memory mirrors of that storage
+  loadBadges();
+  streakN = loadStreak().n;
+  try {
+    const raw = JSON.parse(lsGet('flapstack.life') || '{}');
+    for (const k in life) life[k] = typeof raw[k] === 'number' ? raw[k] : 0;
+  } catch (e) {}
+  try {
+    runHistory = JSON.parse(lsGet('flapstack.history') || '[]');
+    if (!Array.isArray(runHistory)) runHistory = [];
+  } catch (e) { runHistory = []; }
+  {
+    const v = parseFloat(lsGet('flapstack.vol'));
+    audio.vol = v >= 0 && v <= 1 ? v : 1;
+    if (audio.master) audio.master.gain.value = audio.vol;
+  }
+  game.best = parseInt(lsGet('flapstack.best'), 10) || 0;
+  game.sprintBest = parseFloat(lsGet('flapstack.sprint')) || 0;
+  game.attackBest = parseInt(lsGet('flapstack.attack'), 10) || 0;
+  loadDailyBest();
+  game.toasts.length = 0;
+  // park on the title screen so the run the tests abandoned cannot keep
+  // flying, die on its own, and write records into the restored storage
+  game.state = 'START';
+  game.mode = 'free';
 
   window.__testResults = { total: tests.length, passed: passed, failed: tests.length - passed, results: results };
 
